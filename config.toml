@@ -1,0 +1,19 @@
+cache = "cache.json"
+media_dir = "./media"
+media_extensions = [
+    "avi",
+    "flv",
+    "gif",
+    "jpeg",
+    "jpg",
+    "m4v",
+    "mkv",
+    "mov",
+    "mp4",
+    "mpeg",
+    "mpg",
+    "png",
+    "webm",
+    "wmv",
+]
+ignore_files_with = ["$", "System"]
