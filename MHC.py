@@ -32,9 +32,11 @@ def load_config(config_path: str = "config.toml") -> dict:
     logger.debug("Validating config...")
     for key, expected_type in required_keys.items():
         if key not in config or not isinstance(config[key], expected_type):
-            raise ValueError(f"config.toml is missing or has incorrect type for key '{key}' (expected {expected_type.__name__})")
+            raise ValueError(
+                f"config.toml is missing or has incorrect type for key '{key}' (expected {expected_type.__name__})")
     if not all(key in config for key in required_keys):
-        raise ValueError(f"config.toml is missing required key(s): {', '.join(sorted(list(set(required_keys) - set(config.keys()))))}")
+        raise ValueError(
+            f"config.toml is missing required key(s): {', '.join(sorted(list(set(required_keys) - set(config.keys()))))}")
     logger.debug("Config loaded successfully.")
     return config
 
@@ -47,12 +49,14 @@ def load_cache(config: dict) -> dict:
                 cache = json.load(f)
                 logger.debug(f"Loaded cache.")
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to load cache from {config['cache']} due to {e}.")
+            logger.error(
+                f"Failed to load cache from {config['cache']} due to {e}.")
             raise
     else:
-        logger.debug(f"Cache file {config['cache']} does not exist.")
+        logger.debug(f"Cache file '{config['cache']}' does not exist. Generating new cache...")
         cache = {}
-        save_cache(cache, config)
+    cache.setdefault("files", {})
+    cache.setdefault("hashes", {})
     return cache
 
 
@@ -83,14 +87,11 @@ def generate_hash(file_path: typing.Union[str, pathlib.Path], algorithm="sha256"
 def get_media_files(config: dict) -> typing.Iterable[pathlib.Path]:
     media_dir = pathlib.Path(config["media_dir"]).resolve()
     logger.debug(f"Searching for media files in '{media_dir}'...")
-    for file in media_dir.rglob("*"):
-        if file.is_file():
-            # logger.debug(f"Found file: {file}")
-            if file.suffix[1:] in config["media_extensions"]:
-                # logger.debug(f"File has media extension: {file}")
-                if not any(phrase.lower() in file.stem.lower() for phrase in config["ignore_files_with"]):
-                    # logger.debug(f"File does not have any ignore phrases: {file}")
-                    yield file
+    for file_path in media_dir.rglob("*"):
+        if file_path.is_file():
+            if file_path.suffix[1:] in config["media_extensions"]:
+                if not any(phrase.lower() in file_path.stem.lower() for phrase in config["ignore_files_with"]):
+                    yield file_path
 
 
 def get_file_data(file_path: typing.Union[str, pathlib.Path]) -> tuple[int, int, int]:
@@ -109,9 +110,33 @@ def main() -> None:
 
     logger.debug(f"{cache=}")
 
-    for path in get_media_files(config):
-        hash = generate_hash(path)
-        modified_time, created_time, size = get_file_data(path)
+    for file in get_media_files(config):
+        file_path = str(file)
+        modified_time, created_time, size = get_file_data(file_path)
+        if file_path not in cache["files"]:
+            hash = generate_hash(file_path)
+            cache["files"][file_path] = {
+                "modified_time": modified_time,
+                "created_time": created_time,
+                "size": size,
+                "hash": hash
+            }
+            save_cache(cache, config)
+        else:
+            if modified_time != cache["files"][file_path]["modified_time"] or created_time != cache["files"][file_path]["created_time"] or size != cache["files"][file_path]["size"]:
+                hash = generate_hash(file_path)
+                cache["files"][file_path] = {
+                    "modified_time": modified_time,
+                    "created_time": created_time,
+                    "size": size,
+                    "hash": hash
+                }
+                save_cache(cache, config)
+            else:
+                logger.debug(f"File {file_path} has not changed. Skipping...")
+
+    logger.debug(f"{cache=}")
+
 
 def setup_logging(
         logger: logging.Logger,
@@ -124,11 +149,13 @@ def setup_logging(
     # Ensure log_dir is a Path object
     log_file_path = pathlib.Path(log_file_path)
     log_dir = log_file_path.parent
-    log_dir.mkdir(parents=True, exist_ok=True)  # Create logs dir if it does not exist
+    # Create logs dir if it does not exist
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # Limit # of logs in logs folder
     if number_of_logs_to_keep is not None:
-        log_files = sorted([f for f in log_dir.glob("*.log")], key=lambda f: f.stat().st_mtime)
+        log_files = sorted([f for f in log_dir.glob("*.log")],
+                           key=lambda f: f.stat().st_mtime)
         if len(log_files) >= number_of_logs_to_keep:
             for file in log_files[:len(log_files) - number_of_logs_to_keep + 1]:
                 file.unlink()
@@ -138,13 +165,15 @@ def setup_logging(
     # File Handler for date-based log file
     file_handler_date = logging.FileHandler(log_file_path, encoding="utf-8")
     file_handler_date.setLevel(file_logging_level)
-    file_handler_date.setFormatter(logging.Formatter(log_message_format, datefmt=date_format))
+    file_handler_date.setFormatter(logging.Formatter(
+        log_message_format, datefmt=date_format))
     logger.addHandler(file_handler_date)
 
     # Console Handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_logging_level)
-    console_handler.setFormatter(logging.Formatter(log_message_format, datefmt=date_format))
+    console_handler.setFormatter(logging.Formatter(
+        log_message_format, datefmt=date_format))
     logger.addHandler(console_handler)
 
     # Set specific logging levels if needed
@@ -158,7 +187,8 @@ if __name__ == "__main__":
     log_dir = pathlib.Path(f"{script_name} Logs")
     log_file_name = f"{timestamp}_{pc_name}.log"
     log_file_path = log_dir / log_file_name
-    setup_logging(logger, log_file_path, number_of_logs_to_keep=10, log_message_format="%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s")
+    setup_logging(logger, log_file_path, number_of_logs_to_keep=10,
+                  log_message_format="%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s")
 
     error = 0
     try:
@@ -169,7 +199,8 @@ if __name__ == "__main__":
         duration = end_time - start_time
         logger.info(f"Completed operation in {duration:.4f}s.")
     except Exception as e:
-        logger.warning(f"A fatal error has occurred: {repr(e)}\n{traceback.format_exc()}")
+        logger.warning(
+            f"A fatal error has occurred: {repr(e)}\n{traceback.format_exc()}")
         error = 1
     finally:
         sys.exit(error)
