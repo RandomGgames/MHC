@@ -141,11 +141,8 @@ def build_files_cache(cache: dict, config: dict) -> None:
         # If file is in cache, check if it has changed
         else:
             old = cache["files"][file_path]
-            if (
-                modified_time != old["modified_time"]
-                or created_time != old["created_time"]
-                or size != old["size"]
-            ):
+            # If file has changed, update it
+            if (modified_time != old["modified_time"] or created_time != old["created_time"] or size != old["size"]):
                 hash = generate_hash(file_path)
                 cache["files"][file_path] = {
                     "modified_time": modified_time,
@@ -154,9 +151,9 @@ def build_files_cache(cache: dict, config: dict) -> None:
                     "hash": hash
                 }
                 logger.debug(f"Updated file in cache.")
-            # If file has not changed, do nothing
                 changes_since_save += 1
                 total_changes += 1
+            # If file has not changed, do nothing
             else:
                 logger.debug(f"File has not changed. Skipping.")
 
