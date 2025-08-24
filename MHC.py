@@ -1,3 +1,4 @@
+import bisect
 import hashlib
 import json
 import logging
@@ -20,16 +21,15 @@ logger = logging.getLogger(__name__)
 def load_config(config_path: str = "config.toml") -> dict:
     logger.debug("Loading config...")
     required_keys = {"cache", "media_dir"}
-    logger.debug("Reading config file...")
     config = toml.load(config_path)
+
+    logger.debug("Validating config...")
     required_keys = {
         "cache": str,
         "media_dir": str,
         "media_extensions": list,
         "ignore_files_with": list
     }
-
-    logger.debug("Validating config...")
     for key, expected_type in required_keys.items():
         if key not in config or not isinstance(config[key], expected_type):
             raise ValueError(
@@ -45,18 +45,28 @@ def load_cache(config: dict) -> dict:
     logger.debug("Loading cache...")
     if os.path.exists(config["cache"]):
         try:
+            logger.debug(f"Reading cache file...")
             with open(config["cache"]) as f:
                 cache = json.load(f)
-                logger.debug(f"Loaded cache.")
+                logger.debug(f"Read cache file.")
         except json.JSONDecodeError as e:
             logger.error(
                 f"Failed to load cache from {config['cache']} due to {e}.")
-            raise
+            cache = {}
     else:
         logger.debug(f"Cache file '{config['cache']}' does not exist. Generating new cache...")
         cache = {}
     cache.setdefault("files", {})
     cache.setdefault("hashes", {})
+
+    logger.debug("Validating cache...")
+    for file_path in list(cache["files"].keys()):
+        if not pathlib.Path(file_path).exists():
+            logger.debug(f"Removing non-existent file {file_path} from cache.")
+            del cache["files"][file_path]
+    logger.debug("Cache validated successfully.")
+
+    logger.debug("Cache loaded.")
     return cache
 
 
@@ -75,6 +85,27 @@ def save_cache(cache: dict, config: dict) -> None:
         raise
 
 
+def get_media_files(config: dict) -> typing.Iterable[pathlib.Path]:
+    media_dir = pathlib.Path(config["media_dir"]).resolve()
+    logger.debug(f"Searching for media files in '{media_dir}'...")
+    for file_path in media_dir.rglob("*"):
+        if file_path.is_file():
+            if file_path.suffix[1:] in config["media_extensions"]:
+                if not any(phrase.lower() in file_path.stem.lower() for phrase in config["ignore_files_with"]):
+                    logger.debug(f"Found media file: {file_path}")
+                    yield file_path
+
+
+def get_file_data(file_path: typing.Union[str, pathlib.Path]) -> tuple[int, int, int]:
+    logger.debug(f"Getting file data...")
+    file_path = pathlib.Path(file_path)
+    modified_time = file_path.stat().st_mtime_ns
+    created_time = file_path.stat().st_birthtime_ns
+    size = file_path.stat().st_size
+    logger.debug(f"Got file data: {modified_time=}, {created_time=}, {size=}")
+    return modified_time, created_time, size
+
+
 def generate_hash(file_path: typing.Union[str, pathlib.Path], algorithm="sha256") -> str:
     logger.debug(f"Generating hash for {file_path}...")
     with open(file_path, "rb") as f:
@@ -84,35 +115,13 @@ def generate_hash(file_path: typing.Union[str, pathlib.Path], algorithm="sha256"
     return hash
 
 
-def get_media_files(config: dict) -> typing.Iterable[pathlib.Path]:
-    media_dir = pathlib.Path(config["media_dir"]).resolve()
-    logger.debug(f"Searching for media files in '{media_dir}'...")
-    for file_path in media_dir.rglob("*"):
-        if file_path.is_file():
-            if file_path.suffix[1:] in config["media_extensions"]:
-                if not any(phrase.lower() in file_path.stem.lower() for phrase in config["ignore_files_with"]):
-                    yield file_path
-
-
-def get_file_data(file_path: typing.Union[str, pathlib.Path]) -> tuple[int, int, int]:
-    logger.debug(f"Getting file data for {file_path}...")
-    file_path = pathlib.Path(file_path)
-    modified_time = file_path.stat().st_mtime_ns
-    created_time = file_path.stat().st_birthtime_ns
-    size = file_path.stat().st_size
-    logger.debug(f"Got file data: {modified_time = }, {created_time = }, {size = }")
-    return modified_time, created_time, size
-
-
-def main() -> None:
-    config = load_config()
-    cache = load_cache(config)
-
-    logger.debug(f"{cache=}")
-
+def build_files_cache(cache: dict, config: dict) -> None:
+    logger.debug("Building files cache...")
     for file in get_media_files(config):
         file_path = str(file)
         modified_time, created_time, size = get_file_data(file_path)
+
+        # If file is not in cache, add it
         if file_path not in cache["files"]:
             hash = generate_hash(file_path)
             cache["files"][file_path] = {
@@ -121,8 +130,11 @@ def main() -> None:
                 "size": size,
                 "hash": hash
             }
-            save_cache(cache, config)
+            logger.debug(f"Added file to cache.")
+
+        # If file is in cache, check if it has changed
         else:
+            # If file has changed, update it
             if modified_time != cache["files"][file_path]["modified_time"] or created_time != cache["files"][file_path]["created_time"] or size != cache["files"][file_path]["size"]:
                 hash = generate_hash(file_path)
                 cache["files"][file_path] = {
@@ -131,11 +143,95 @@ def main() -> None:
                     "size": size,
                     "hash": hash
                 }
-                save_cache(cache, config)
-            else:
-                logger.debug(f"File {file_path} has not changed. Skipping...")
+                logger.debug(f"Updated file in cache.")
 
-    logger.debug(f"{cache=}")
+            # If file has not changed, do nothing
+            else:
+                logger.debug(f"File has not changed. Skipping.")
+    save_cache(cache, config)
+
+
+def build_hashes_cache(cache: dict, config: dict) -> None:
+    cache["hashes"] = {}
+
+    for file_path, file_data in cache["files"].items():
+        file_hash = file_data["hash"]
+
+        # Our sort key: created_time ascending, modified_time ascending, size descending
+        key = (file_data["created_time"], file_data["modified_time"], -file_data["size"])
+        entry = (key, file_path, file_data)
+
+        if file_hash not in cache["hashes"]:
+            cache["hashes"][file_hash] = [entry]
+        else:
+            # Find insertion point to keep the list sorted
+            keys_list = [e[0] for e in cache["hashes"][file_hash]]
+            idx = bisect.bisect(keys_list, key)
+            cache["hashes"][file_hash].insert(idx, entry)
+
+    # Strip down to the desired final structure
+    for file_hash, entries in cache["hashes"].items():
+        cache["hashes"][file_hash] = [
+            {path: data} for (_, path, data) in entries
+        ]
+
+    save_cache(cache, config)
+
+
+def rename_files_to_hashes(cache: dict, config: dict) -> None:
+    logger.debug("Renaming files to hashes...")
+
+    # Group files by hash
+    hash_groups = {}
+    for file_path, file_data in cache["files"].items():
+        hash_groups.setdefault(file_data["hash"], []).append(file_path)
+
+    # Step 1: Build mapping of final desired names
+    rename_plan = {}
+    for file_hash, files in hash_groups.items():
+        for i, file_path in enumerate(files, start=1):
+            ext = pathlib.Path(file_path).suffix.lower()
+            if i == 1:
+                new_name = f"{file_hash}{ext}"
+            else:
+                new_name = f"{file_hash} (copy {i}){ext}"
+            rename_plan[file_path] = str(pathlib.Path(file_path).with_name(new_name))
+
+    # Step 2: Resolve conflicts with temporary renames
+    for old, new in list(rename_plan.items()):
+        new_path = pathlib.Path(new)
+        if new_path.exists() and new not in rename_plan:
+            # Another file already has this name on disk → move it aside
+            tmp_name = str(new_path.with_stem(
+                new_path.stem + f"_{int(time.time() * 1000)}"
+            ))
+            logger.debug(f"Temporarily renaming '{new}' to '{tmp_name}'")
+            os.rename(new, tmp_name)
+
+            # Update cache for the file that was moved aside
+            cache["files"][tmp_name] = cache["files"].pop(new)
+
+    # Step 3: Apply renames according to plan
+    for old, new in rename_plan.items():
+        if old != new:
+            logger.debug(f"Renaming '{old}' → '{new}'")
+            os.rename(old, new)
+            logger.debug(f"Renamed.")
+
+            # Update cache so it's consistent
+            cache["files"][new] = cache["files"].pop(old)
+        else:
+            logger.debug(f"Skipping rename of '{old}'.")
+
+    save_cache(cache, config)
+
+
+def main() -> None:
+    config = load_config()
+    cache = load_cache(config)
+    build_files_cache(cache, config)
+    build_hashes_cache(cache, config)
+    rename_files_to_hashes(cache, config)
 
 
 def setup_logging(
