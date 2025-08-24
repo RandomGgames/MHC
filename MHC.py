@@ -157,23 +157,20 @@ def build_hashes_cache(cache: dict, config: dict) -> None:
     for file_path, file_data in cache["files"].items():
         file_hash = file_data["hash"]
 
-        # Our sort key: created_time ascending, modified_time ascending, size descending
+        # Sort key: created_time asc, modified_time asc, size desc
         key = (file_data["created_time"], file_data["modified_time"], -file_data["size"])
         entry = (key, file_path, file_data)
 
         if file_hash not in cache["hashes"]:
             cache["hashes"][file_hash] = [entry]
         else:
-            # Find insertion point to keep the list sorted
             keys_list = [e[0] for e in cache["hashes"][file_hash]]
             idx = bisect.bisect(keys_list, key)
             cache["hashes"][file_hash].insert(idx, entry)
 
-    # Strip down to the desired final structure
+    # Strip to final form
     for file_hash, entries in cache["hashes"].items():
-        cache["hashes"][file_hash] = [
-            {path: data} for (_, path, data) in entries
-        ]
+        cache["hashes"][file_hash] = [{path: data} for (_, path, data) in entries]
 
     save_cache(cache, config)
 
@@ -181,15 +178,14 @@ def build_hashes_cache(cache: dict, config: dict) -> None:
 def rename_files_to_hashes(cache: dict, config: dict) -> None:
     logger.debug("Renaming files to hashes...")
 
-    # Group files by hash
-    hash_groups = {}
-    for file_path, file_data in cache["files"].items():
-        hash_groups.setdefault(file_data["hash"], []).append(file_path)
+    # Group files by hash (cache['hashes'] is already ordered properly)
+    hash_groups = cache["hashes"]
 
     # Step 1: Build mapping of final desired names
     rename_plan = {}
-    for file_hash, files in hash_groups.items():
-        for i, file_path in enumerate(files, start=1):
+    for file_hash, entries in hash_groups.items():
+        for i, entry in enumerate(entries, start=1):
+            file_path = list(entry.keys())[0]
             ext = pathlib.Path(file_path).suffix.lower()
             if i == 1:
                 new_name = f"{file_hash}{ext}"
@@ -200,26 +196,25 @@ def rename_files_to_hashes(cache: dict, config: dict) -> None:
     # Step 2: Resolve conflicts with temporary renames
     for old, new in list(rename_plan.items()):
         new_path = pathlib.Path(new)
-        if new_path.exists() and new not in rename_plan:
-            # Another file already has this name on disk → move it aside
-            tmp_name = str(new_path.with_stem(
-                new_path.stem + f"_{int(time.time() * 1000)}"
+        if new_path.exists() and new not in rename_plan.values():
+            tmp_name = str(new_path.with_name(
+                f"{new_path.stem}_{int(time.time() * 1000)}{new_path.suffix}"
             ))
-            logger.debug(f"Temporarily renaming '{new}' to '{tmp_name}'")
+            logger.debug(f"Temporarily renaming '{new}' → '{tmp_name}'")
             os.rename(new, tmp_name)
 
-            # Update cache for the file that was moved aside
-            cache["files"][tmp_name] = cache["files"].pop(new)
+            # Update cache for the temporarily moved file
+            cache["files"][tmp_name] = cache["files"].pop(str(new_path))
 
     # Step 3: Apply renames according to plan
     for old, new in rename_plan.items():
         if old != new:
             logger.debug(f"Renaming '{old}' → '{new}'")
             os.rename(old, new)
-            logger.debug(f"Renamed.")
 
-            # Update cache so it's consistent
+            # Update cache
             cache["files"][new] = cache["files"].pop(old)
+            logger.debug(f"Renamed and cache updated.")
         else:
             logger.debug(f"Skipping rename of '{old}'.")
 
