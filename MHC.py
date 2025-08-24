@@ -117,7 +117,11 @@ def generate_hash(file_path: typing.Union[str, pathlib.Path], algorithm="sha256"
 
 def build_files_cache(cache: dict, config: dict) -> None:
     logger.debug("Building files cache...")
-    for file in get_media_files(config):
+
+    changes_since_save = 0
+    total_changes = 0
+
+    for idx, file in enumerate(get_media_files(config), start=1):
         file_path = str(file)
         modified_time, created_time, size = get_file_data(file_path)
 
@@ -131,11 +135,17 @@ def build_files_cache(cache: dict, config: dict) -> None:
                 "hash": hash
             }
             logger.debug(f"Added file to cache.")
+            changes_since_save += 1
+            total_changes += 1
 
         # If file is in cache, check if it has changed
         else:
-            # If file has changed, update it
-            if modified_time != cache["files"][file_path]["modified_time"] or created_time != cache["files"][file_path]["created_time"] or size != cache["files"][file_path]["size"]:
+            old = cache["files"][file_path]
+            if (
+                modified_time != old["modified_time"]
+                or created_time != old["created_time"]
+                or size != old["size"]
+            ):
                 hash = generate_hash(file_path)
                 cache["files"][file_path] = {
                     "modified_time": modified_time,
@@ -144,11 +154,24 @@ def build_files_cache(cache: dict, config: dict) -> None:
                     "hash": hash
                 }
                 logger.debug(f"Updated file in cache.")
-
             # If file has not changed, do nothing
+                changes_since_save += 1
+                total_changes += 1
             else:
                 logger.debug(f"File has not changed. Skipping.")
-    save_cache(cache, config)
+
+        # Periodic save every 100 changes
+        if changes_since_save >= 100:
+            logger.debug("Saving cache (checkpoint)...")
+            save_cache(cache, config)
+            changes_since_save = 0
+
+    # Final save if any unsaved changes remain
+    if changes_since_save > 0:
+        logger.debug("Final save of unsaved changes...")
+        save_cache(cache, config)
+
+    logger.debug(f"Finished building cache. Total changes: {total_changes}")
 
 
 def build_hashes_cache(cache: dict, config: dict) -> None:
