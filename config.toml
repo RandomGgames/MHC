@@ -6,6 +6,7 @@ media_extensions = [
     "gif",
     "jpeg",
     "jpg",
+    "heic",
     "m4v",
     "mkv",
     "mov",
