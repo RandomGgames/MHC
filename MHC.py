@@ -56,6 +56,11 @@ def load_cache(config: dict) -> dict:
             del cache["files"][file_path]
     logger.debug("Cache validated successfully.")
 
+    normalized = {}
+    for k, v in cache["files"].items():
+        normalized[pathlib.Path(k).as_posix()] = v
+    cache["files"] = normalized
+
     logger.debug("Cache loaded.")
     return cache
 
@@ -150,7 +155,7 @@ def build_files_cache(cache: dict, config: dict) -> None:
     total_changes = 0
 
     for idx, file_path_obj in enumerate(get_media_files(config), start=1):
-        file_path = str(file_path_obj)
+        file_path = pathlib.Path(file_path_obj).as_posix()
         try:
             modified_time, created_time, size = get_file_data(file_path)
         except Exception:
@@ -285,14 +290,14 @@ def rename_files_to_hashes(cache: dict, config: dict) -> None:
 
     # Step 3: Apply renames according to final rename plan
     for old, new in rename_plan.items():
-        old_path = pathlib.Path(old)
-        new_path = pathlib.Path(new)
+        old_path = pathlib.Path(old).resolve()
+        new_path = pathlib.Path(new).resolve()
 
         if not old_path.exists():
             logger.warning(f"Skipping rename '{old}' → '{new}': source missing.")
             continue
 
-        if old == new:
+        if old_path.as_posix() == new_path.as_posix():
             logger.debug(f"Skipping rename of '{old}'. Already correct.")
             continue
 
@@ -316,7 +321,7 @@ def rename_files_to_hashes(cache: dict, config: dict) -> None:
         else:
             logger.warning(f"Cache entry for '{old_key}' missing when renaming to '{new_key}'.")
 
-        logger.debug("Rename applied and cache updated.")
+        logger.info("Rename applied.")
 
     save_cache(cache, config)
 
