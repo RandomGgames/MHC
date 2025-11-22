@@ -16,6 +16,7 @@ media_extensions = [
     "png",
     "webm",
     "wmv",
+    "bmp",
 ]
 ignore_files_with = ["$", "System"]
 
