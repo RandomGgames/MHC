@@ -80,6 +80,7 @@ def load_cache(path: Path = Path("cache.json")) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                logger.debug("Loaded cache.")
         except json.JSONDecodeError:
             logger.exception("Failed to decode cache file. Using empty cache.")
         except OSError:
@@ -128,20 +129,20 @@ def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
         raise
 
 
-def find_files(root: Path, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
+def find_files(root: Path | str, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
     """
-    Yield files in a directory with optional regex-based include and ignore filters.
+    Yield files in a directory filtered by regex-based include and ignore patterns.
 
     Args:
         root: Directory path to search.
         recursive: If True, search all subdirectories.
-        include: List of regex strings or compiled patterns. Only files matching at least
-            one pattern are included. If None, all files are included.
-        ignore: List of regex strings or compiled patterns. Files matching any pattern
-            are skipped.
+        include: List of regex strings or compiled patterns. Only files matching
+            at least one pattern are included. If None, all files are included.
+        ignore: List of regex strings or compiled patterns. Files matching any
+            pattern are skipped.
 
     Yields:
-        pathlib.Path objects for files that match the include/ignore criteria.
+        pathlib.Path objects for files matching the include/ignore criteria.
 
     Raises:
         FileNotFoundError: If `root` does not exist.
@@ -168,11 +169,11 @@ def find_files(root: Path, *, recursive: bool = True, include: list[str | Patter
 
         path_str = str(path)
 
-        # Ignore if matches any ignore pattern
+        # Skip files matching any ignore pattern
         if any(p.search(path_str) for p in ignore_patterns):
             continue
 
-        # Include only if matches at least one include pattern (or include_patterns empty)
+        # Include only if it matches at least one include pattern (or no include pattern)
         if include_patterns and not any(p.search(path_str) for p in include_patterns):
             continue
 
@@ -454,32 +455,69 @@ def delete_duplicate_files(cache: dict, config: dict) -> None:
     save_cache(cache, config)
 
 
+def purge_cache(cache: dict) -> dict:
+    if "files" in cache:
+        for file_path in cache["files"].keys():
+            file_path = Path(file_path)
+            if not file_path.exists():
+                cache["files"].pop(file_path, None)
+                logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
+    return cache
+
+
 def main(config) -> None:
-    logger.debug(f"Config: {json.dumps(config)}")
+    # logger.debug(f"Config: {json.dumps(config)}")
 
     cache_file = Path(str(config.get("cache_file")))
     if cache_file is None:
         logger.error("No cache file specified in config.")
         raise ValueError
-    logger.debug(f"Cache file: {json.dumps(str(cache_file))}")
+    # logger.debug(f"Cache file: {json.dumps(str(cache_file))}")
 
     media_root = Path(str(config.get("media_dir")))
     if media_root is None:
         logger.error("No media root specified in config.")
         raise ValueError
-    logger.debug(f"Media root: {json.dumps(str(media_root))}")
+    # logger.debug(f"Media root: {json.dumps(str(media_root))}")
 
     media_extensions = list(config.get("media_extensions"))
     if media_extensions is None:
         logger.error("No media extensions specified in config.")
         raise ValueError
-    logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
+    # logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
 
     cache = load_cache(cache_file)
+    cache.setdefault("files", {})
+    cache.setdefault("hashes", {})
+    cache = purge_cache(cache)
     logger.debug(f"Cache: {json.dumps(cache)}")
 
-    for file in find_files(media_root, recursive=True, include=media_extensions):
-        logger.debug(f"{file}")
+    for file_path in find_files(media_root, recursive=True, include=media_extensions):
+        full_file_path = Path(file_path).resolve()
+        # logger.debug(f"{full_file_path}")
+
+        if full_file_path not in cache["files"]:
+            try:
+                modified_time, created_time, size = get_file_data(full_file_path)
+            except Exception:
+                logger.exception(f"Failed to stat file {full_file_path}; skipping.")
+                continue
+
+            try:
+                file_hash = generate_hash(full_file_path)
+            except Exception:
+                logger.warning(f"Skipping file {full_file_path} due to hash/read error.")
+                continue
+
+            cache["files"][full_file_path.as_posix()] = {
+                "modified_time": modified_time,
+                "created_time": created_time,
+                "size": size,
+                "hash": file_hash
+            }
+            logger.debug(f"Added file to cache: {full_file_path.as_posix()}")
+            save_cache(cache, cache_file)
+
     # build_files_cache(cache, config)
     # build_hashes_cache(cache, config)
     # delete_duplicate_files(cache, config)
