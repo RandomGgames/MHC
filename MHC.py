@@ -62,7 +62,7 @@ def read_toml(file_path: Path | str) -> dict:
         raise
 
 
-def load_cache(path: typing.Union[Path, str] = "cache.json") -> dict:
+def load_cache(path: Path = Path("cache.json")) -> dict:
     """
     Loads a cache from the given path.
 
@@ -72,45 +72,59 @@ def load_cache(path: typing.Union[Path, str] = "cache.json") -> dict:
     Returns:
     dict: The loaded cache.
     """
-    logger.debug("Loading cache...")
     path = Path(path)
+    logger.debug(f"Loading cache file {json.dumps(str(path))}...")
+
+    data = {}
     if path.exists():
         try:
-            logger.debug("Reading cache file...")
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                logger.debug("Read cache file.")
-        except json.JSONDecodeError as e:
-            logger.error("Failed to load cache from %s due to %s. Generating blank cache...", json.dumps(str(path)), e)
-            data = {}
+        except json.JSONDecodeError:
+            logger.exception("Failed to decode cache file. Using empty cache.")
+        except OSError:
+            logger.exception("Failed to read cache file. Using empty cache.")
     else:
-        logger.debug("Cache file %s does not exist. Generating blank cache...", json.dumps(str(path)))
-        data = {}
+        logger.info("Cache file does not exist. Using empty cache.")
 
-    logger.debug("Cache loaded.")
     return data
 
 
-def save_cache(data: dict, path: typing.Union[Path, str] = "cache.json") -> None:
+def ensure_dir(path: Path) -> None:
+    """Checks if a directory exists (using pathlib) and creates it if it doesn't."""
+    # Ensure path is a directory in case it's a file
+    path = Path(path)
+    if path.is_file():
+        path = path.parent
+
+    try:
+        if not path.exists():
+            path.mkdir(parents=True)
+            logger.debug(f"Created folder: {json.dumps(str(path))}")
+    except OSError as e:
+        logger.error(f"Error creating directory {json.dumps(str(path))}", e)
+        raise
+
+
+def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
     """
-    Saves the given cache data to the given path.
+    Saves the given cache data to the specified path.
 
     Args:
-    data (dict): The cache data to save.
-    path (typing.Union[pathlib.Path, str], optional): The path of the cache file to save. Defaults to "cache.json".
+        data (dict): The cache data to save.
+        path (str | Path, optional): The path of the cache file to save. Defaults to "cache.json".
     """
-    logger.debug("Saving cache...")
     path = Path(path)
+    logger.debug(f"Saving cache to {json.dumps(str(path))}...")
+
     try:
-        cache_dir = path.parent
-        if not cache_dir.exists():
-            cache_dir.mkdir(parents=True)
-            logger.debug("Created cache directory %s.", json.dumps(str(cache_dir)))
+        ensure_dir(path)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
-        logger.debug("Saved cache.")
-    except Exception as e:
-        logger.error("Failed to save cache to %s due to %s.", json.dumps(str(path)), e)
+
+        logger.debug(f"Saved cache with {len(data)} entries.")
+    except Exception:
+        logger.exception("Failed to save cache.")
         raise
 
 
@@ -441,8 +455,28 @@ def delete_duplicate_files(cache: dict, config: dict) -> None:
 
 
 def main(config) -> None:
-    cache = load_cache(config)
-    logger.debug(f"{cache=}")
+    logger.debug(f"Config: {json.dumps(config)}")
+
+    cache_file = Path(str(config.get("cache_file")))
+    if cache_file is None:
+        logger.error("No cache file specified in config.")
+        raise ValueError
+    logger.debug(f"Cache file: {json.dumps(str(cache_file))}")
+
+    media_root = Path(str(config.get("media_dir")))
+    if media_root is None:
+        logger.error("No media root specified in config.")
+        raise ValueError
+    logger.debug(f"Media root: {json.dumps(str(media_root))}")
+
+    media_extensions = list(config.get("media_extensions"))
+    if media_extensions is None:
+        logger.error("No media extensions specified in config.")
+        raise ValueError
+    logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
+
+    cache = load_cache(cache_file)
+    logger.debug(f"Cache: {json.dumps(cache)}")
 
     # build_files_cache(cache, config)
     # build_hashes_cache(cache, config)
