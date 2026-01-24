@@ -1,150 +1,235 @@
+"""
+A python script that hashes media and assists in removing duplicates.
+"""
+
 import bisect
 import hashlib
 import json
 import logging
 import os
 import pathlib
-import send2trash
+import re
 import shutil
 import socket
 import sys
 import time
-import toml
+import tomllib
 import traceback
 import typing
+import zipfile
 from datetime import datetime
+from pathlib import Path
+from typing import Iterable, Pattern
+
+import win32com.client
+
+import send2trash
 
 logger = logging.getLogger(__name__)
 
 
-__version__ = "1.0.0"  # Major.Minor.Patch
+__version__ = "1.1.0"  # Major.Minor.Patch
 
 
-def read_toml(file_path: typing.Union[str, pathlib.Path]) -> dict:
+def read_toml(file_path: Path | str) -> dict:
     """
-    Read configuration settings from the TOML file.
+    Reads a TOML file and returns its contents as a dictionary.
+
+    Args:
+        file_path (Path | str): The file path of the TOML file to read.
+
+    Returns:
+        dict: The contents of the TOML file as a dictionary.
+
+    Raises:
+        FileNotFoundError: If the TOML file does not exist.
+        OSError: If the file cannot be read.
+        tomllib.TOMLDecodeError (or toml.TomlDecodeError): If the file is invalid TOML.
     """
-    file_path = pathlib.Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-    config = toml.load(file_path)
-    return config
+    path = Path(file_path)
 
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {json.dumps(str(path))}")
 
-def load_cache(config: dict) -> dict:
-    logger.debug("Loading cache...")
-    if os.path.exists(config["cache"]):
-        try:
-            logger.debug(f"Reading cache file...")
-            with open(config["cache"]) as f:
-                cache = json.load(f)
-                logger.debug(f"Read cache file.")
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"Failed to load cache from {config['cache']} due to {e}.")
-            cache = {}
-    else:
-        logger.debug(f"Cache file '{config['cache']}' does not exist. Generating new cache...")
-        cache = {}
-    cache.setdefault("files", {})
-    cache.setdefault("hashes", {})
-
-    logger.debug("Validating cache...")
-    for file_path in list(cache["files"].keys()):
-        if not pathlib.Path(file_path).exists():
-            logger.debug(f"Removing non-existent file {file_path} from cache.")
-            del cache["files"][file_path]
-    logger.debug("Cache validated successfully.")
-
-    normalized = {}
-    for k, v in cache["files"].items():
-        normalized[pathlib.Path(k).as_posix()] = v
-    cache["files"] = normalized
-
-    logger.debug("Cache loaded.")
-    return cache
-
-
-def save_cache(cache: dict, config: dict) -> None:
-    logger.debug("Saving cache...")
     try:
-        cache_path = pathlib.Path(config["cache"])
-        cache_dir = cache_path.parent
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Read TOML as bytes
+        with path.open("rb") as f:
+            data = tomllib.load(f)  # Replace with 'toml.load(f)' if using the toml package
+        return data
 
-        temp_path = cache_path.with_suffix(".tmp")
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=4)
-
-        # Atomic replace
-        temp_path.replace(cache_path)
-        logger.debug(f"Saved cache to {cache_path}.")
-    except Exception as e:
-        logger.error(f"Failed to save cache to {config.get('cache')} due to {e}.")
+    except (OSError, tomllib.TOMLDecodeError):
+        logger.exception(f"Failed to read TOML file: {json.dumps(str(file_path))}")
         raise
 
 
-def get_media_files(config: dict) -> typing.Iterable[pathlib.Path]:
-    media_dir_raw = config.get("media_dir")
-    if not isinstance(media_dir_raw, (str, os.PathLike)):
-        raise TypeError(f"config['media_dir'] must be a string path, got {type(media_dir_raw)}")
+def load_cache(path: typing.Union[Path, str] = "cache.json") -> dict:
+    """
+    Loads a cache from the given path.
 
-    media_dir = pathlib.Path(media_dir_raw).resolve()
+    Args:
+    path (typing.Union[pathlib.Path, str], optional): The path of the cache file to load. Defaults to "cache.json".
 
-    logger.debug(f"Searching for media files in '{media_dir}'...")
+    Returns:
+    dict: The loaded cache.
+    """
+    logger.debug("Loading cache...")
+    path = Path(path)
+    if path.exists():
+        try:
+            logger.debug("Reading cache file...")
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                logger.debug("Read cache file.")
+        except json.JSONDecodeError as e:
+            logger.error("Failed to load cache from %s due to %s. Generating blank cache...", json.dumps(str(path)), e)
+            data = {}
+    else:
+        logger.debug("Cache file %s does not exist. Generating blank cache...", json.dumps(str(path)))
+        data = {}
 
-    exts = {ext.lower().lstrip(".") for ext in config.get("media_extensions", [])}
-    ignore_phrases = [p.lower() for p in config.get("ignore_files_with", [])]
+    logger.debug("Cache loaded.")
+    return data
 
-    if not media_dir.exists():
-        logger.warning(f"Media directory does not exist: {media_dir}")
-        return
 
-    for file_path in media_dir.rglob("*"):
-        if not file_path.is_file():
+def save_cache(data: dict, path: typing.Union[Path, str] = "cache.json") -> None:
+    """
+    Saves the given cache data to the given path.
+
+    Args:
+    data (dict): The cache data to save.
+    path (typing.Union[pathlib.Path, str], optional): The path of the cache file to save. Defaults to "cache.json".
+    """
+    logger.debug("Saving cache...")
+    path = Path(path)
+    try:
+        cache_dir = path.parent
+        if not cache_dir.exists():
+            cache_dir.mkdir(parents=True)
+            logger.debug("Created cache directory %s.", json.dumps(str(cache_dir)))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        logger.debug("Saved cache.")
+    except Exception as e:
+        logger.error("Failed to save cache to %s due to %s.", json.dumps(str(path)), e)
+        raise
+
+
+def find_files(root: str | Path, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
+    """
+    Yield files in a directory with optional regex-based include and ignore filters.
+
+    Args:
+        root: Directory path to search.
+        recursive: If True, search all subdirectories.
+        include: List of regex strings or compiled patterns. Only files matching at least
+            one pattern are included. If None, all files are included.
+        ignore: List of regex strings or compiled patterns. Files matching any pattern
+            are skipped.
+
+    Yields:
+        pathlib.Path objects for files that match the include/ignore criteria.
+
+    Raises:
+        FileNotFoundError: If `root` does not exist.
+        ValueError: If `root` is not a directory.
+    """
+    root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"Root path does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"Expected a directory, got: {root}")
+
+    # Compile regexes if needed
+    include_patterns: list[Pattern] = [
+        re.compile(p) if isinstance(p, str) else p for p in (include or [])
+    ]
+    ignore_patterns: list[Pattern] = [
+        re.compile(p) if isinstance(p, str) else p for p in (ignore or [])
+    ]
+
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    for path in iterator:
+        if not path.is_file():
             continue
 
-        suffix = file_path.suffix.lower().lstrip(".")
-        if not suffix or suffix not in exts:
+        path_str = str(path)
+
+        # Ignore if matches any ignore pattern
+        if any(p.search(path_str) for p in ignore_patterns):
             continue
 
-        if any(phrase in file_path.stem.lower() for phrase in ignore_phrases):
+        # Include only if matches at least one include pattern (or include_patterns empty)
+        if include_patterns and not any(p.search(path_str) for p in include_patterns):
             continue
 
-        logger.debug(f"Found media file: {file_path}")
-        yield file_path
+        yield path
 
 
-def get_file_data(file_path: typing.Union[str, pathlib.Path]) -> tuple[int, int, int]:
-    file_path = pathlib.Path(file_path)
-    st = file_path.stat()
-    modified_time = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
-    # Prefer birthtime if available, otherwise use ctime (metadata change time)
-    created_time = getattr(st, "st_birthtime_ns", getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))
-    size = st.st_size
-    logger.debug(f"Got file data: {modified_time=}, {created_time=}, {size=}")
-    return modified_time, created_time, size
+def get_file_data(file_path: Path | str) -> dict[str, int]:
+    """
+    Gets file stats safely across different Operating Systems.
+    Returns times in nanoseconds.
+    """
+    path = Path(file_path)
+    stat = path.stat()
+    mtime = stat.st_mtime_ns
+    try:
+        # macOS/BSD
+        ctime = getattr(stat, 'st_birthtime_ns', None)
+        if ctime is None:
+            # Windows (st_ctime is creation time on Windows)
+            ctime = stat.st_ctime_ns
+    except AttributeError:
+        # Linux fallback (st_ctime is metadata change, not birth)
+        ctime = mtime
+
+    size = stat.st_size
+    logger.debug(f"File stats for {path.name}: {mtime=}, {ctime=}, {size=}")
+    return {"modified": mtime, "created": ctime, "size": size}
 
 
-def generate_hash(file_path: typing.Union[str, pathlib.Path], algorithm="sha256") -> str:
-    file_path = pathlib.Path(file_path)
-    logger.debug(f"Generating hash for {file_path}...")
+def generate_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
+    """
+    Generate a hexadecimal hash for a file.
+
+    Works with Python >=3.6. If running on Python >=3.11, uses
+    `hashlib.file_digest` for optimal performance. Otherwise,
+    reads the file in chunks to avoid memory issues with large files.
+
+    Args:
+        file_path: Path to the file (str or Path).
+        algorithm: Hash algorithm name (e.g., 'sha256', 'md5').
+
+    Returns:
+        Hexadecimal string of the file hash.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        ValueError: if the algorithm is not supported.
+        OSError: if reading the file fails.
+    """
+    file_path = Path(file_path)
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File does not exist: {file_path}")
+
+    logger.debug(f"Generating hash for {json.dumps(str(file_path))} using {algorithm}...")
     try:
         with open(file_path, "rb") as f:
-            # Prefer file_digest if available (Python 3.11+)
+            # Python 3.11+ optimal path
             try:
                 digest = hashlib.file_digest(f, algorithm)
                 hexd = digest.hexdigest()
             except AttributeError:
+                # Fallback for older Python: read in chunks
                 h = hashlib.new(algorithm)
                 for chunk in iter(lambda: f.read(1024 * 1024), b""):
                     h.update(chunk)
                 hexd = h.hexdigest()
     except Exception as e:
-        # Bubble up with context so callers can decide to skip the file
-        logger.exception(f"Failed to read/hash file {file_path}: {e}")
+        logger.exception(f"Failed to generate hash for {file_path}: {e}")
         raise
-    logger.debug(f"Generated hash '{hexd}' for {file_path}")
+
+    logger.debug(f"Generated hash {json.dumps(str(hexd))} for {file_path}")
     return hexd
 
 
@@ -355,13 +440,15 @@ def delete_duplicate_files(cache: dict, config: dict) -> None:
     save_cache(cache, config)
 
 
-def main() -> None:
+def main(config) -> None:
     cache = load_cache(config)
-    build_files_cache(cache, config)
-    build_hashes_cache(cache, config)
-    delete_duplicate_files(cache, config)
-    build_hashes_cache(cache, config)
-    rename_files_to_hashes(cache, config)
+    logger.debug(f"{cache=}")
+
+    # build_files_cache(cache, config)
+    # build_hashes_cache(cache, config)
+    # delete_duplicate_files(cache, config)
+    # build_hashes_cache(cache, config)
+    # rename_files_to_hashes(cache, config)
 
 
 def format_duration_long(duration_seconds: float) -> str:
@@ -372,22 +459,21 @@ def format_duration_long(duration_seconds: float) -> str:
     """
     ns = int(duration_seconds * 1_000_000_000)
     units = [
-        ('y', 365 * 24 * 60 * 60 * 1_000_000_000),
-        ('mo', 30 * 24 * 60 * 60 * 1_000_000_000),
-        ('d', 24 * 60 * 60 * 1_000_000_000),
-        ('h', 60 * 60 * 1_000_000_000),
-        ('m', 60 * 1_000_000_000),
-        ('s', 1_000_000_000),
-        ('ms', 1_000_000),
-        ('us', 1_000),
-        ('ns', 1),
+        ("y", 365 * 24 * 60 * 60 * 1_000_000_000),
+        ("mo", 30 * 24 * 60 * 60 * 1_000_000_000),
+        ("d", 24 * 60 * 60 * 1_000_000_000),
+        ("h", 60 * 60 * 1_000_000_000),
+        ("m", 60 * 1_000_000_000),
+        ("s", 1_000_000_000),
+        ("ms", 1_000_000),
+        ("us", 1_000),
+        ("ns", 1),
     ]
     parts = []
     for name, factor in units:
         value, ns = divmod(ns, factor)
         if value:
             parts.append(f"{value}{name}")
-        # Stop after two largest non-zero units
         if len(parts) == 2:
             break
     if not parts:
@@ -395,99 +481,163 @@ def format_duration_long(duration_seconds: float) -> str:
     return "".join(parts)
 
 
+def enforce_max_log_count(dir_path: Path | str, max_count: int | None, script_name: str) -> None:
+    """Keep only the N most recent logs for this script."""
+    if max_count is None or max_count <= 0:
+        return
+
+    dir_path = Path(dir_path)
+
+    # Get all logs for this script, sorted by name (which is our timestamp)
+    # Newest will be at the end of the list
+    files = sorted([f for f in dir_path.glob(f"*{script_name}*.log") if f.is_file()])
+
+    # If we have more than the limit, calculate how many to delete
+    if len(files) > max_count:
+        to_delete = files[:-max_count]  # Everything except the last N files
+        for f in to_delete:
+            try:
+                f.unlink()
+                logger.debug(f"Deleted old log: {f.name}")
+            except OSError as e:
+                logger.error(f"Failed to delete {f.name}: {e}")
+
+
 def setup_logging(
-        logger: logging.Logger,
-        log_file_path: typing.Union[str, pathlib.Path],
-        number_of_logs_to_keep: typing.Union[int, None] = None,
+        logger_obj: logging.Logger,
+        file_path: Path | str,
+        script_name: str,
+        max_log_files: int | None = None,
         console_logging_level: int = logging.DEBUG,
         file_logging_level: int = logging.DEBUG,
-        log_message_format: str = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] [%(name)s]: %(message)s",
-        date_format: str = "%Y-%m-%d %H:%M:%S") -> None:
-    log_file_path = pathlib.Path(log_file_path)
-    log_dir = log_file_path.parent
-    log_dir.mkdir(parents=True, exist_ok=True)
+        message_format: str = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s",
+        date_format: str = "%Y-%m-%d %H:%M:%S"
+) -> None:
+    """
+    Set up logging for a script.
 
-    # Limit # of logs in logs folder
-    if number_of_logs_to_keep is not None:
-        log_files = sorted([f for f in log_dir.glob("*.log")], key=lambda f: f.stat().st_mtime)
-        if len(log_files) > number_of_logs_to_keep:
-            for file in log_files[:-number_of_logs_to_keep]:
-                file.unlink()
+    Args:
+    logger_obj (logging.Logger): The logger object to configure.
+    file_path (Path | str): The file path of the log file to write.
+    max_log_files (int | None, optional): The maximum total size for all logs in the folder. Defaults to None.
+    console_logging_level (int, optional): The logging level for console output. Defaults to logging.DEBUG.
+    file_logging_level (int, optional): The logging level for file output. Defaults to logging.DEBUG.
+    message_format (str, optional): The format string for log messages. Defaults to "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s".
+    date_format (str, optional): The format string for log timestamps. Defaults to "%Y-%m-%d %H:%M:%S".
+    """
 
-    # Clear old handlers to avoid duplication
-    logger.handlers.clear()
-    logger.setLevel(file_logging_level)
+    file_path = Path(file_path)
+    dir_path = file_path.parent
+    dir_path.mkdir(parents=True, exist_ok=True)
 
-    formatter = logging.Formatter(log_message_format, datefmt=date_format)
+    logger_obj.handlers.clear()
+    logger_obj.setLevel(file_logging_level)
+
+    formatter = logging.Formatter(message_format, datefmt=date_format)
 
     # File Handler
-    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
+    file_handler = logging.FileHandler(file_path, encoding="utf-8")
     file_handler.setLevel(file_logging_level)
     file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    logger_obj.addHandler(file_handler)
 
     # Console Handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_logging_level)
     console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    logger_obj.addHandler(console_handler)
+
+    if max_log_files is not None:
+        enforce_max_log_count(dir_path, max_log_files, script_name)
+
+
+def load_config(file_path: Path | str) -> dict:
+    """
+    Load configuration from a TOML file.
+
+    Args:
+    file_path (Path | str): The file path of the TOML file to read.
+
+    Returns:
+    dict: The contents of the TOML file as a dictionary.
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {json.dumps(str(file_path))}")
+    data = read_toml(file_path)
+    return data
+
+
+def bootstrap():
+    """
+    Handles environment setup, configuration loading,
+    and logging before executing the main script logic.
+    """
+    exit_code = 0
+    try:
+        # Resolve paths and configuration
+        script_path = Path(__file__)
+        script_name = script_path.stem
+        config_path = script_path.with_name(f"{script_name}_config.toml")
+
+        # Load settings
+        config = load_config(config_path)
+        logger_config = config.get("logging", {})
+
+        # Parse log levels and formats
+        console_log_level = getattr(logging, logger_config.get("console_logging_level", "INFO").upper(), logging.INFO)
+        file_log_level = getattr(logging, logger_config.get("file_logging_level", "INFO").upper(), logging.INFO)
+        log_message_format = logger_config.get("log_message_format", "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s")
+
+        # Setup directories and filenames
+        logs_folder = Path(logger_config.get("logs_folder_name", "logs"))
+        logs_folder.mkdir(parents=True, exist_ok=True)
+
+        pc_name = socket.gethostname()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = logs_folder / f"{timestamp}__{script_name}__{pc_name}.log"
+
+        # Initialize logging
+        setup_logging(
+            logger_obj=logger,
+            file_path=log_path,
+            script_name=script_name,
+            max_log_files=logger_config.get("max_log_files"),
+            console_logging_level=console_log_level,
+            file_logging_level=file_log_level,
+            message_format=log_message_format
+        )
+
+        exit_behavior_config = config.get("exit_behavior", {})
+        pause_before_exit = exit_behavior_config.get("always_pause", False)
+        pause_before_exit_on_error = exit_behavior_config.get("pause_on_error", True)
+
+        start_ns = time.perf_counter_ns()
+        logger.info(f"Script: {json.dumps(script_name)} | Version: {__version__} | Host: {json.dumps(pc_name)}")
+
+        main(config)
+
+        end_ns = time.perf_counter_ns()
+        duration_str = format_duration_long((end_ns - start_ns) / 1e9)
+        logger.info(f"Execution completed in {duration_str}.")
+
+    except KeyboardInterrupt:
+        logger.warning("Operation interrupted by user.")
+        exit_code = 130
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        # Using 'err' or 'exc' is standard; logging the traceback handles the 'broad-except'
+        logger.error(f"A fatal error has occurred: {e}")
+        exit_code = 1
+    finally:
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+    if pause_before_exit or (pause_before_exit_on_error and exit_code != 0):
+        input("Press Enter to exit...")
+
+    return exit_code
 
 
 if __name__ == "__main__":
-    config_path = pathlib.Path("config.toml")
-    if not config_path.exists():
-        raise FileNotFoundError(f"Missing {config_path}")
-    global config
-    config = read_toml(config_path)
-
-    console_logging_level = getattr(logging, config.get("logging", {}).get("console_logging_level", "INFO").upper(), logging.DEBUG)
-    file_logging_level = getattr(logging, config.get("logging", {}).get("file_logging_level", "INFO").upper(), logging.DEBUG)
-    logs_file_path = config.get("logging", {}).get("logs_file_path", "logs")
-    use_logs_folder = config.get("logging", {}).get("use_logs_folder", True)
-    number_of_logs_to_keep = config.get("logging", {}).get("number_of_logs_to_keep", 10)
-    log_message_format = config.get("logging", {}).get(
-        "log_message_format",
-        "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s"
-    )
-
-    script_name = pathlib.Path(__file__).stem
-    pc_name = socket.gethostname()
-    if use_logs_folder:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_dir = pathlib.Path(f"{logs_file_path}/{script_name}")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file_name = f"{timestamp}_{script_name}_{pc_name}.log"
-        log_file_path = log_dir / log_file_name
-    else:
-        log_file_path = pathlib.Path(f"{script_name}_{pc_name}.log")
-
-    setup_logging(
-        logger,
-        log_file_path,
-        console_logging_level=console_logging_level,
-        file_logging_level=file_logging_level,
-        number_of_logs_to_keep=number_of_logs_to_keep,
-        log_message_format=log_message_format
-    )
-
-    error = 0
-    try:
-        start_time = time.perf_counter_ns()
-        logger.info(f"Script: {script_name} | Version: {__version__} | Host: {pc_name}")
-
-        main()
-        end_time = time.perf_counter_ns()
-        duration = end_time - start_time
-        duration = format_duration_long(duration / 1e9)
-        logger.info(f"Execution completed in {duration}.")
-    except KeyboardInterrupt:
-        logger.warning("Operation interrupted by user.")
-        error = 130
-    except Exception as e:
-        logger.warning(f"A fatal error has occurred: {repr(e)}\n{traceback.format_exc()}")
-        error = 1
-    finally:
-        for handler in logger.handlers:
-            handler.close()
-        logger.handlers.clear()
-        sys.exit(error)
+    sys.exit(bootstrap())
