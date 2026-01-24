@@ -1,4 +1,4 @@
-cache = "cache.json"
+cache_file = "cache.json"
 media_dir = "./media"
 media_extensions = [
     "avi",
