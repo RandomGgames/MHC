@@ -20,10 +20,13 @@ media_extensions = [
 ]
 ignore_files_with = ["$", "System"]
 
+[exit_behavior]
+always_pause = false
+pause_on_error = true
+
 [logging]
-console_logging_level = "DEBUG"
-file_logging_level = "DEBUG"
-logs_folder_path = "Logs"
-use_logs_folder = true
-number_of_logs_to_keep = 10
-log_message_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s"
+console_logging_level = "DEBUG"                                                           # DEBUG, INFO, WARNING, ERROR
+file_logging_level = "DEBUG"                                                              # DEBUG, INFO, WARNING, ERROR
+log_message_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
+logs_folder_name = "logs"
+max_log_files = 50
