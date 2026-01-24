@@ -1,22 +1,21 @@
 cache_file = "cache.json"
 media_dir = "./media"
 media_extensions = [
-    "avi",
-    "flv",
-    "gif",
-    "jpeg",
-    "jpg",
-    "heic",
-    "m4v",
-    "mkv",
-    "mov",
-    "mp4",
-    "mpeg",
-    "mpg",
-    "png",
-    "webm",
-    "wmv",
-    "bmp",
+    "(?i)\\.avi$",
+    "(?i)\\.flv$",
+    "(?i)\\.gif$",
+    "(?i)\\.jpe?g$",
+    "(?i)\\.heic$",
+    "(?i)\\.m4v$",
+    "(?i)\\.mkv$",
+    "(?i)\\.mov$",
+    "(?i)\\.mp4$",
+    "(?i)\\.mpeg$",
+    "(?i)\\.mpg$",
+    "(?i)\\.png$",
+    "(?i)\\.webm$",
+    "(?i)\\.wmv$",
+    "(?i)\\.bmp$",
 ]
 ignore_files_with = ["$", "System"]
 
@@ -29,4 +28,4 @@ console_logging_level = "DEBUG"                                                 
 file_logging_level = "DEBUG"                                                              # DEBUG, INFO, WARNING, ERROR
 log_message_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
 logs_folder_name = "logs"
-max_log_files = 50
+max_log_files = 5
