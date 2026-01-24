@@ -128,7 +128,7 @@ def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
         raise
 
 
-def find_files(root: str | Path, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
+def find_files(root: Path, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
     """
     Yield files in a directory with optional regex-based include and ignore filters.
 
@@ -478,6 +478,8 @@ def main(config) -> None:
     cache = load_cache(cache_file)
     logger.debug(f"Cache: {json.dumps(cache)}")
 
+    for file in find_files(media_root, recursive=True, include=media_extensions):
+        logger.debug(f"{file}")
     # build_files_cache(cache, config)
     # build_hashes_cache(cache, config)
     # delete_duplicate_files(cache, config)
