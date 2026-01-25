@@ -28,4 +28,4 @@ console_logging_level = "DEBUG"                                                 
 file_logging_level = "DEBUG"                                                              # DEBUG, INFO, WARNING, ERROR
 log_message_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
 logs_folder_name = "logs"
-max_log_files = 5
+max_log_files = 1
