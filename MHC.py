@@ -24,6 +24,7 @@ import zipfile
 from datetime import datetime
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
+from itertools import islice
 from pathlib import Path
 from PIL import Image, ImageTk
 from PIL.ExifTags import TAGS
@@ -148,18 +149,21 @@ def load_cache(path: Path = Path("cache.json")) -> dict:
 
 
 def ensure_dir(path: Path) -> None:
-    """Checks if a directory exists (using pathlib) and creates it if it doesn't."""
-    # Ensure path is a directory in case it's a file
+    """Ensures the parent directory for a given file path exists."""
     path = Path(path).resolve()
-    if path.is_file():
+
+    # If the path doesn't exist, we assume it's a file if it has an extension.
+    # Otherwise, if it's already a file, we want its parent.
+    if path.suffix or path.is_file():
         path = path.parent
 
     try:
+        # exist_ok=True replaces the manual 'if not path.exists()' check
         if not path.exists():
-            path.mkdir(parents=True)
-            logger.debug(f"Created folder: {json.dumps(str(path))}")
-    except OSError as e:
-        logger.error(f"Error creating directory {json.dumps(str(path))}", e)
+            path.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Created {json.dumps(str(path))}")
+    except OSError:
+        logger.error(f"Error creating directory {json.dumps(str(path))}")
         raise
 
 
@@ -179,7 +183,7 @@ def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
-        logger.debug(f"Saved cache with {len(data)} entries.")
+        logger.debug("Saved cache.")
     except Exception:
         logger.exception("Failed to save cache.")
         raise
@@ -348,10 +352,10 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
         try:
             modified_time, created_time, size = get_file_data(full_file_path)
-            # properties = get_windows_details(full_file_path)
-            # date_taken = properties.get("Date taken", None)
-            # if date_taken is not None:
-            #     date_taken = date_string_to_unix_nanos(date_taken)
+            properties = get_windows_details(full_file_path)
+            date_taken = properties.get("Date taken", None)
+            if date_taken is not None:
+                date_taken = date_string_to_unix_nanos(date_taken)
         except Exception:
             logger.exception(f"Failed to get file stats for {json.dumps(str(full_file_path.as_posix()))}. Skipping.")
             continue
@@ -404,65 +408,65 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
 def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
     """
-    Build a hashes index from cached files and update only changed hashes.
-
-    - Builds a fresh hashes cache from cache["files"]
-    - Compares per-hash with existing cache["hashes"]
-    - Updates only hashes that changed
-    - Logs changes per hash
-    - Saves cache once at the end
+    Build a hashes index: { hash: { path: data } }
+    Sorted by: Created (oldest), Modified (oldest), Size (largest).
     """
     logger.info("Building hashes cache...")
     cache_file = Path(cache_file)
 
     old_hashes = cache.get("hashes", {})
-    new_hashes = {}
+    temp_grouping = {}
 
-    # Build new hashes cache from files
+    added = 0
+    modified = 0
+    removed = 0
+
+    # 1. Group files by hash
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data.get("hash")
         if not file_hash:
-            logger.warning(f"No hash found for file {file_path}; skipping.")
             continue
 
-        key = (
-            file_data["created_time"],
-            file_data["modified_time"],
-            -file_data["size"],
+        # Criteria: Created (asc), Modified (asc), Size (desc via negation)
+        sort_key = (
+            file_data.get("created_time") or 0,
+            file_data.get("modified_time") or 0,
+            -abs(file_data.get("size") or 0),
         )
+        temp_grouping.setdefault(file_hash, []).append((sort_key, file_path, file_data))
 
-        new_hashes.setdefault(file_hash, []).append((key, file_path, file_data))
-
-    # Sort and normalize format
-    for file_hash, entries in new_hashes.items():
+    # 2. Sort and build the ordered dictionary
+    final_hashes = {}
+    for file_hash, entries in temp_grouping.items():
+        # Sort based on the sort_key tuple
         entries.sort(key=lambda e: e[0])
-        new_hashes[file_hash] = [{path: data} for _, path, data in entries]
 
-    # Compare and update only changed hashes
-    updated_hashes = old_hashes.copy()
+        # Build inner dict (Insertion order follows the sort)
+        ordered_sub_dict = {path: data for _, path, data in entries}
 
-    for file_hash, new_entries in new_hashes.items():
-        old_entries = old_hashes.get(file_hash)
+        # Check against old cache for reporting
+        old_val = old_hashes.get(file_hash)
+        if old_val is None:
+            added += 1
+        elif old_val != ordered_sub_dict:
+            modified += 1
 
-        if old_entries is None:
-            updated_hashes[file_hash] = new_entries
-            logger.debug(f"Added new hash {file_hash}.")
-        elif old_entries != new_entries:
-            updated_hashes[file_hash] = new_entries
-            logger.debug(f"Updated hash {file_hash}.")
-        else:
-            logger.debug(f"No changes for hash {file_hash}.")
+        final_hashes[file_hash] = ordered_sub_dict
 
-    # Optional: detect removed hashes
-    removed_hashes = set(old_hashes) - set(new_hashes)
-    for file_hash in removed_hashes:
-        updated_hashes.pop(file_hash, None)
-        logger.debug(f"Removed hash {file_hash} (no longer present).")
+    # 3. Detect removals
+    removed_hashes = set(old_hashes) - set(final_hashes)
+    removed = len(removed_hashes)
 
-    cache["hashes"] = updated_hashes
+    # 4. Finalize
+    total_changes = added + modified + removed
+    cache["hashes"] = final_hashes
 
-    save_cache(cache, cache_file)
-    logger.debug(f"Finished building hashes cache. Total Hashes: {len(cache['hashes'])}. Total changes: {len(updated_hashes)}")
+    if total_changes > 0:
+        save_cache(cache, cache_file)
+        logger.info(f"Hashes cache updated. Changes: {total_changes} ({added} added, {modified} modified, {removed} removed).")
+    else:
+        logger.info("No changes detected in hashes cache.")
+
     return cache
 
 
@@ -484,6 +488,48 @@ def purge_cache(cache: dict) -> dict:
                 logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
 
     return cache
+
+
+def send_to_recycle_bin(path: Path) -> bool:
+    """
+    Sends any duplicate files to the recycle bin
+
+    Args:
+        duplicates: A list of duplicate files
+    """
+    path = Path(path)
+
+    try:
+        send2trash.send2trash(str(path))
+        logger.info(f"Sent {json.dumps(str(path.as_posix()))} to recycle bin.")
+        return True
+    except OSError:
+        logger.error(f"Failed to send {json.dumps(str(path.as_posix()))} to recycle bin.")
+        return False
+
+
+def remove_duplicates(cache: dict, cache_file: Path) -> None:
+    """
+    Sends any duplicate files to the recycle bin and removes them from the cache
+    """
+    deleted_files = 0
+    for hash_val, file_entries in cache.get("hashes", {}).items():
+        # logger.debug(f"{hash_val=}")
+        # logger.debug(f"{file_entries=}")
+        if len(file_entries) > 1:
+            for path in list(file_entries.keys())[1:]:
+                logger.debug(f"{path=}")
+                path = Path(path)
+                if path.exists():
+                    was_recycled_successfully = send_to_recycle_bin(path)
+                    if was_recycled_successfully:
+                        cache["files"].pop(path.resolve().as_posix(), None)
+                        # logger.debug(f"Removed duplicate file from cache: {json.dumps(str(path.as_posix()))}")
+                        cache["hashes"][hash_val].pop(path.resolve().as_posix(), None)
+                        # logger.debug(f"Removed duplicate file from hashes: {json.dumps(str(path.as_posix()))}")
+                        deleted_files += 1
+    logger.info(f"Removed {deleted_files} duplicate files from cache.")
+    save_cache(cache, cache_file)
 
 
 def main(config) -> None:
@@ -513,6 +559,8 @@ def main(config) -> None:
     cache = build_files_cache(cache, cache_file, media_root, media_extensions)
     cache = build_hashes_cache(cache, cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+
+    remove_duplicates(cache, cache_file)
 
 
 def format_duration_long(duration_seconds: float) -> str:
