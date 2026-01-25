@@ -7,26 +7,25 @@ import hashlib
 import json
 import logging
 import os
-import pathlib
 import re
+import send2trash
 import shutil
 import socket
 import sys
 import time
+import tkinter
+import tkinter.messagebox
 import tomllib
 import traceback
 import typing
+import win32com.client
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from PIL import Image, ImageTk
 from typing import Iterable, Pattern
 
-import win32com.client
-
-import send2trash
-
 logger = logging.getLogger(__name__)
-
 
 __version__ = "1.1.0"  # Major.Minor.Patch
 
@@ -180,7 +179,7 @@ def find_files(root: Path | str, *, recursive: bool = True, include: list[str | 
         yield path
 
 
-def get_file_data(file_path: Path | str) -> dict[str, int]:
+def get_file_data(file_path: Path | str) -> tuple[int, int, int]:
     """
     Gets file stats safely across different Operating Systems.
     Returns times in nanoseconds.
@@ -199,8 +198,7 @@ def get_file_data(file_path: Path | str) -> dict[str, int]:
         ctime = mtime
 
     size = stat.st_size
-    logger.debug(f"File stats for {path.name}: {mtime=}, {ctime=}, {size=}")
-    return {"modified": mtime, "created": ctime, "size": size}
+    return mtime, ctime, size
 
 
 def generate_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
@@ -248,82 +246,117 @@ def generate_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
     return hexd
 
 
-def build_files_cache(cache: dict, config: dict) -> None:
-    logger.debug("Building files cache...")
+def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, media_extensions: list[str | Pattern], save_cache_every: int = 100) -> dict:
+    """
+    Scan media files and update the cache with metadata and hashes.
+
+    Features:
+        - Uses `find_files` with regex-based include filters
+        - Purges non-existent files before scanning
+        - Saves periodically every `checkpoint` changes
+        - Saves at the end if there are unsaved changes
+        - Handles hash/read errors gracefully
+
+    Args:
+        cache: The existing cache dictionary.
+        cache_file: Path to the cache file for saving.
+        media_root: Root directory to scan for media files.
+        media_extensions: List of regex strings or compiled patterns for files to include.
+        checkpoint: Number of changes before saving a partial cache.
+    """
+    logger.info("Building cache...")
+
+    cache.setdefault("files", {})
+    cache.setdefault("hashes", {})
+
+    # Purge entries for missing files
+    cache_file = Path(cache_file)
+    cache = purge_cache(cache)
 
     changes_since_save = 0
     total_changes = 0
 
-    for idx, file_path_obj in enumerate(get_media_files(config), start=1):
-        file_path = pathlib.Path(file_path_obj).as_posix()
+    for file_path in find_files(media_root, recursive=True, include=media_extensions):
+        full_file_path = Path(file_path).resolve().as_posix()
+        logger.debug(f"Processing file {json.dumps(str(full_file_path))}...")
+
         try:
-            modified_time, created_time, size = get_file_data(file_path)
+            modified_time, created_time, size = get_file_data(full_file_path)
         except Exception:
-            logger.exception(f"Failed to stat file {file_path}; skipping.")
+            logger.exception("Failed to get file stats. Skipping.")
             continue
 
-        # If file is not in cache, add it
-        if file_path not in cache["files"]:
+        # Determine if we need to add/update the cache entry
+        old_entry = cache["files"].get(full_file_path)
+        needs_update = (
+            old_entry is None or
+            old_entry.get("modified_time") != modified_time or
+            old_entry.get("created_time") != created_time or
+            old_entry.get("size") != size
+        )
+
+        if needs_update:
             try:
-                file_hash = generate_hash(file_path)
+                file_hash = generate_hash(full_file_path)
             except Exception:
-                logger.warning(f"Skipping file {file_path} due to hash/read error.")
+                logger.warning(f"Skipping file {full_file_path} due to hash/read error.")
                 continue
 
-            cache["files"][file_path] = {
+            cache["files"][full_file_path] = {
                 "modified_time": modified_time,
                 "created_time": created_time,
                 "size": size,
                 "hash": file_hash
             }
-            logger.debug(f"Added file to cache: {file_path}")
+
+            if old_entry is None:
+                logger.debug("Added file to cache.")
+            else:
+                logger.debug("Updated file in cache.")
+
             changes_since_save += 1
             total_changes += 1
-
         else:
-            old = cache["files"][file_path]
-            if (modified_time != old.get("modified_time") or
-                    created_time != old.get("created_time") or
-                    size != old.get("size")):
-                try:
-                    file_hash = generate_hash(file_path)
-                except Exception:
-                    logger.warning(f"Skipping update of {file_path} due to hash/read error.")
-                    continue
+            logger.debug("No changes detected.")
 
-                cache["files"][file_path] = {
-                    "modified_time": modified_time,
-                    "created_time": created_time,
-                    "size": size,
-                    "hash": file_hash
-                }
-                logger.debug(f"Updated file in cache: {file_path}")
-                changes_since_save += 1
-                total_changes += 1
-            else:
-                logger.debug(f"File has not changed. Skipping: {file_path}")
-
-        # Periodic save every 100 changes
-        if changes_since_save >= 100:
-            logger.debug("Saving cache (checkpoint)...")
-            save_cache(cache, config)
+        # Checkpoint save every `checkpoint` changes
+        if changes_since_save >= save_cache_every:
+            save_cache(cache, cache_file)
             changes_since_save = 0
 
-    # Final save if any unsaved changes remain
+    # Final save for any remaining changes
     if changes_since_save > 0:
-        logger.debug("Final save of unsaved changes...")
-        save_cache(cache, config)
+        save_cache(cache, cache_file)
 
     logger.debug(f"Finished building cache. Total changes: {total_changes}")
+    return cache
 
 
-def build_hashes_cache(cache: dict, config: dict) -> None:
+def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
+    """
+    Build a hashes index from the cached files.
+
+    Features:
+        - Creates `cache["hashes"]` mapping: {file_hash: list of {file_path: file_data}}
+        - Entries are sorted by (created_time asc, modified_time asc, size desc)
+        - Saves the cache to `cache_file` at the end
+        - Works after `build_files_cache` has populated `cache["files"]`
+
+    Args:
+        cache: Cache dictionary containing 'files' entries with 'hash' keys.
+        cache_file: Path to the cache file for saving.
+    """
+    logger.debug("Building hashes cache...")
+    cache_file = Path(cache_file)
+
     cache["hashes"] = {}
+    for file_path, file_data in cache.get("files", {}).items():
+        file_hash = file_data.get("hash")
+        if not file_hash:
+            logger.warning(f"No hash found for file {file_path}; skipping.")
+            continue
 
-    for file_path, file_data in cache["files"].items():
-        file_hash = file_data["hash"]
-
-        # Sort key: created_time asc, modified_time asc, size desc
+        # Sorting key: (created_time asc, modified_time asc, size desc)
         key = (file_data["created_time"], file_data["modified_time"], -file_data["size"])
         entry = (key, file_path, file_data)
 
@@ -334,139 +367,194 @@ def build_hashes_cache(cache: dict, config: dict) -> None:
             idx = bisect.bisect(keys_list, key)
             cache["hashes"][file_hash].insert(idx, entry)
 
-    # Strip to final form
+    # Convert to final form: list of {file_path: file_data}
     for file_hash, entries in cache["hashes"].items():
         cache["hashes"][file_hash] = [{path: data} for (_, path, data) in entries]
 
-    save_cache(cache, config)
-
-
-def rename_files_to_hashes(cache: dict, config: dict) -> None:
-    logger.debug("Renaming files to hashes...")
-
-    hash_groups = cache.get("hashes", {})
-
-    # Step 1: Build mapping of final desired names
-    rename_plan: dict[str, str] = {}
-    for file_hash, entries in hash_groups.items():
-        for i, entry in enumerate(entries, start=1):
-            file_path = list(entry.keys())[0]
-            ext = pathlib.Path(file_path).suffix.lower()
-            if i == 1:
-                new_name = f"{file_hash}{ext}"
-            else:
-                new_name = f"{file_hash} (copy {i}){ext}"
-            rename_plan[file_path] = str(pathlib.Path(file_path).with_name(new_name))
-
-    # Normalize planned destination paths to a set of POSIX strings for conflict checking
-    planned_destinations = {pathlib.Path(p).as_posix() for p in rename_plan.values()}
-
-    # Step 2: Resolve conflicts with temporary renames
-    for old, new in list(rename_plan.items()):
-        new_path = pathlib.Path(new)
-        # If target exists on disk AND is not one of our intended destinations, move it aside
-        if new_path.exists() and new_path.as_posix() not in planned_destinations:
-            tmp_name = str(
-                new_path.with_name(
-                    f"{new_path.stem}_{int(time.time() * 1000)}{new_path.suffix}"
-                )
-            )
-            logger.debug(f"Temporarily renaming '{new}' → '{tmp_name}'")
-            try:
-                new_path.rename(tmp_name)
-            except OSError:
-                shutil.move(str(new_path), tmp_name)
-
-            # Update cache: remove old key, insert new (use POSIX keys)
-            old_key = new_path.as_posix()
-            new_key = pathlib.Path(tmp_name).as_posix()
-            old_data = cache["files"].pop(old_key, None)
-            if old_data is not None:
-                cache["files"][new_key] = old_data
-            else:
-                logger.warning(
-                    f"Tried to update cache for temporarily moved file {old_key}, but it was not in cache."
-                )
-
-    # Step 3: Apply renames according to final rename plan
-    for old, new in rename_plan.items():
-        old_path = pathlib.Path(old).resolve()
-        new_path = pathlib.Path(new).resolve()
-
-        if not old_path.exists():
-            logger.warning(f"Skipping rename '{old}' → '{new}': source missing.")
-            continue
-
-        if old_path.as_posix() == new_path.as_posix():
-            logger.debug(f"Skipping rename of '{old}'. Already correct.")
-            continue
-
-        if new_path.exists() and new_path.as_posix() not in planned_destinations:
-            logger.warning(f"Cannot rename '{old}' → '{new}': destination exists.")
-            continue
-
-        logger.debug(f"Renaming '{old}' → '{new}'")
-        try:
-            old_path.rename(new_path)
-        except OSError:
-            # fallback across filesystems
-            shutil.move(str(old_path), str(new_path))
-
-        # Update cache safely (use POSIX keys)
-        old_key = old_path.as_posix()
-        new_key = new_path.as_posix()
-        entry = cache["files"].pop(old_key, None)
-        if entry is not None:
-            cache["files"][new_key] = entry
-        else:
-            logger.warning(f"Cache entry for '{old_key}' missing when renaming to '{new_key}'.")
-
-        logger.info("Rename applied.")
-
-    save_cache(cache, config)
-
-
-def delete_duplicate_files(cache: dict, config: dict) -> None:
-    removed = 0
-
-    for file_hash, entries in list(cache.get("hashes", {}).items()):
-        if len(entries) <= 1:
-            continue
-
-        keep_file = list(entries[0].keys())[0]
-
-        for entry in entries[1:]:
-            file_path = list(entry.keys())[0]
-            p = pathlib.Path(file_path)
-
-            try:
-                if p.exists():
-                    logger.info(f"Sending duplicate to trash: {file_path}")
-                    send2trash.send2trash(str(p))
-                else:
-                    logger.debug(f"Duplicate missing on disk (skip): {file_path}")
-            except Exception:
-                logger.exception(f"Failed to send {file_path} to trash.")
-
-            cache["files"].pop(file_path, None)
-            removed += 1
-
-    logger.info(f"Removed {removed} duplicate files.")
-    save_cache(cache, config)
-
-
-def purge_cache(cache: dict) -> dict:
-    if "files" in cache:
-        for file_path in cache["files"].keys():
-            file_path = Path(file_path)
-            if not file_path.exists():
-                cache["files"].pop(file_path, None)
-                logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
+    save_cache(cache, cache_file)
+    logger.debug(f"Hashes cache built and saved to {json.dumps(str(cache_file))}")
     return cache
 
 
+def purge_cache(cache: dict) -> dict:
+    """
+    Remove entries from the cache whose files no longer exist.
+
+    Args:
+        cache: The cache dictionary, expected to have a 'files' key.
+
+    Returns:
+        The cleaned cache dictionary.
+    """
+    if "files" in cache:
+        for file_path_str in list(cache["files"].keys()):
+            file_path = Path(file_path_str)
+            if not file_path.exists():
+                cache["files"].pop(file_path_str, None)
+                logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
+
+    return cache
+
+
+def get_windows_details(file_path: str | Path, max_columns: int = 512) -> dict[str, str]:
+    """
+    Return Windows 'Details' tab properties for a file using the Shell Property System.
+
+    - Windows only.
+    - Requires pywin32: pip install pywin32
+    - Keys are localized to the OS display language, matching File Explorer.
+    - Values are formatted like Explorer shows them.
+
+    Args:
+        file_path: Target file.
+        max_columns: Maximum number of property columns to probe.
+
+    Returns:
+        Dict of {property_label: value} for all non-empty properties.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    if os.name != "nt":
+        raise OSError("get_windows_details is only supported on Windows")
+
+    # Bind to Shell
+    shell = win32com.client.Dispatch("Shell.Application")
+    folder = shell.NameSpace(str(p.parent))
+    if folder is None:
+        raise RuntimeError(f"Shell.NameSpace failed for {p.parent}")
+    item = folder.ParseName(p.name)
+    if item is None:
+        raise RuntimeError(f"Shell.ParseName failed for {p}")
+
+    props: dict[str, str] = {}
+    blanks = 0
+
+    for i in range(max_columns):
+        header = folder.GetDetailsOf(None, i)
+        if not header:
+            blanks += 1
+            if blanks >= 25:
+                break
+            continue
+        blanks = 0
+
+        value = folder.GetDetailsOf(item, i)
+        if isinstance(value, str):
+            value = value.strip()
+        if value:
+            props[str(header).strip()] = str(value)
+
+    return props
+
+
+def show_duplicates(duplicates: list[str]) -> None:
+    """
+    Display duplicate files in a Tkinter window as boxes with:
+      - Image at top
+      - Delete button underneath
+      - File details below
+    Boxes are arranged left-to-right, wrapping as needed.
+    Scrollbars appear if content overflows.
+    """
+    import tkinter
+    from pathlib import Path
+    from PIL import Image, ImageTk
+    import send2trash
+
+    if not duplicates:
+        logger.info("No duplicates to show.")
+        return
+
+    root = tkinter.Tk()
+    root.title("Duplicate Files")
+    root.state("zoomed")  # maximize on primary monitor
+
+    # Outer frame with scrollbars
+    outer_frame = tkinter.Frame(root)
+    outer_frame.pack(fill="both", expand=True)
+
+    canvas = tkinter.Canvas(outer_frame)
+    h_scroll = tkinter.Scrollbar(outer_frame, orient="horizontal", command=canvas.xview)
+    v_scroll = tkinter.Scrollbar(outer_frame, orient="vertical", command=canvas.yview)
+
+    canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    v_scroll.pack(side="right", fill="y")
+    h_scroll.pack(side="bottom", fill="x")
+
+    # Scrollable frame inside canvas
+    scrollable_frame = tkinter.Frame(canvas)
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+    def update_scrollregion(event=None):
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    scrollable_frame.bind("<Configure>", update_scrollregion)
+
+    # Grid layout variables
+    max_columns = 4  # adjust to how many images per row
+    row = 0
+    col = 0
+
+    # Display each duplicate
+    for file_path in duplicates:
+        file_path_obj = Path(file_path)
+        box_frame = tkinter.Frame(scrollable_frame, borderwidth=1, relief="solid", padx=5, pady=5)
+        box_frame.grid(row=row, column=col, padx=10, pady=10, sticky="n")
+
+        # Image preview
+        try:
+            if file_path_obj.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"]:
+                img = Image.open(file_path_obj)
+                img.thumbnail((200, 200))
+                tk_img = ImageTk.PhotoImage(img)
+                img_label = tkinter.Label(box_frame, image=tk_img)
+                img_label.image = tk_img
+                img_label.pack()
+            else:
+                # Video / non-image placeholder
+                placeholder = tkinter.Label(box_frame, text=file_path_obj.name, width=25, height=10, bg="gray", fg="white", wraplength=180, justify="center")
+                placeholder.pack()
+        except Exception as e:
+            logger.warning(f"Could not preview {file_path_obj}: {e}")
+            placeholder = tkinter.Label(box_frame, text=file_path_obj.name, width=25, height=10, bg="gray", fg="white", wraplength=180, justify="center")
+            placeholder.pack()
+
+        # Delete button
+        def delete_file(path=file_path_obj, frame=box_frame):
+            try:
+                send2trash.send2trash(path)
+                logger.info(f"Deleted {path}")
+                frame.destroy()
+            except Exception as e:
+                logger.error(f"Failed to delete {path}: {e}")
+
+        del_btn = tkinter.Button(box_frame, text="Delete", command=delete_file)
+        del_btn.pack(pady=5)
+
+        # File details
+        details_frame = tkinter.Frame(box_frame)
+        details_frame.pack(fill="both", expand=True)
+        try:
+            details = get_windows_details(file_path_obj)
+            for k, v in details.items():
+                lbl = tkinter.Label(details_frame, text=f"{k}: {v}", anchor="w", justify="left", wraplength=200)
+                lbl.pack(fill="x")
+        except Exception as e:
+            logger.warning(f"Could not retrieve details for {file_path_obj}: {e}")
+
+        # Increment grid position
+        col += 1
+        if col >= max_columns:
+            col = 0
+            row += 1
+
+    root.mainloop()
+
+
 def main(config) -> None:
-    # logger.debug(f"Config: {json.dumps(config)}")
+    logger.debug(f"Config: {json.dumps(config)}")
 
     cache_file = Path(str(config.get("cache_file")))
     if cache_file is None:
@@ -487,41 +575,18 @@ def main(config) -> None:
     # logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
 
     cache = load_cache(cache_file)
-    cache.setdefault("files", {})
-    cache.setdefault("hashes", {})
-    cache = purge_cache(cache)
     logger.debug(f"Cache: {json.dumps(cache)}")
 
-    for file_path in find_files(media_root, recursive=True, include=media_extensions):
-        full_file_path = Path(file_path).resolve()
-        # logger.debug(f"{full_file_path}")
+    cache = build_files_cache(cache, cache_file, media_root, media_extensions)
+    cache = build_hashes_cache(cache, cache_file)
 
-        if full_file_path not in cache["files"]:
-            try:
-                modified_time, created_time, size = get_file_data(full_file_path)
-            except Exception:
-                logger.exception(f"Failed to stat file {full_file_path}; skipping.")
-                continue
+    for hash_val in cache.get("hashes", {}):
+        images = cache["hashes"].get(hash_val, [])
+        if len(images) > 1:
+            image_paths = [list(img.keys())[0] for img in images]
+            show_duplicates(image_paths)
 
-            try:
-                file_hash = generate_hash(full_file_path)
-            except Exception:
-                logger.warning(f"Skipping file {full_file_path} due to hash/read error.")
-                continue
-
-            cache["files"][full_file_path.as_posix()] = {
-                "modified_time": modified_time,
-                "created_time": created_time,
-                "size": size,
-                "hash": file_hash
-            }
-            logger.debug(f"Added file to cache: {full_file_path.as_posix()}")
-            save_cache(cache, cache_file)
-
-    # build_files_cache(cache, config)
-    # build_hashes_cache(cache, config)
     # delete_duplicate_files(cache, config)
-    # build_hashes_cache(cache, config)
     # rename_files_to_hashes(cache, config)
 
 
@@ -588,24 +653,16 @@ def setup_logging(
         date_format: str = "%Y-%m-%d %H:%M:%S"
 ) -> None:
     """
-    Set up logging for a script.
+    Set up logging for a script safely.
 
-    Args:
-    logger_obj (logging.Logger): The logger object to configure.
-    file_path (Path | str): The file path of the log file to write.
-    max_log_files (int | None, optional): The maximum total size for all logs in the folder. Defaults to None.
-    console_logging_level (int, optional): The logging level for console output. Defaults to logging.DEBUG.
-    file_logging_level (int, optional): The logging level for file output. Defaults to logging.DEBUG.
-    message_format (str, optional): The format string for log messages. Defaults to "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s".
-    date_format (str, optional): The format string for log timestamps. Defaults to "%Y-%m-%d %H:%M:%S".
+    Immediate flush for Tkinter callbacks is handled automatically.
     """
-
     file_path = Path(file_path)
     dir_path = file_path.parent
     dir_path.mkdir(parents=True, exist_ok=True)
 
     logger_obj.handlers.clear()
-    logger_obj.setLevel(file_logging_level)
+    logger_obj.setLevel(min(console_logging_level, file_logging_level))
 
     formatter = logging.Formatter(message_format, datefmt=date_format)
 
