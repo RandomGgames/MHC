@@ -1,33 +1,44 @@
+# pylint: disable=no-member
 """
 A python script that hashes media and assists in removing duplicates.
 """
 
-import bisect
-import exiftool
+# import bisect
+# import cv2
+# import exiftool
 import hashlib
+# import imagehash
+import io
 import json
+# import librosa
 import logging
+import mimetypes
+# import numpy as np
 import os
 import re
 import send2trash
-import shutil
+# import shutil
 import socket
 import sys
 import time
-import tkinter
-import tkinter.messagebox
+# import tkinter
+# import tkinter.messagebox
+# import toml
 import tomllib
-import traceback
-import typing
+# import traceback
+# import typing
 import win32com.client
-import zipfile
+# import zipfile
 from datetime import datetime
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
-from itertools import islice
+# from hachoir.metadata import extractMetadata
+# from hachoir.parser import createParser
+# from imagehash import hex_to_hash
+# from itertools import islice
 from pathlib import Path
-from PIL import Image, ImageTk
-from PIL.ExifTags import TAGS
+from PIL import Image
+# from PIL import ImageOps
+# from PIL import ImageTk
+# from PIL.ExifTags import TAGS
 from typing import Iterable, Pattern
 
 
@@ -262,49 +273,54 @@ def get_file_data(file_path: Path | str) -> tuple[int, int, int]:
     return mtime, ctime, size
 
 
-def generate_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
+def generate_file_hash(
+    file_path: str | Path,
+    algorithm: str = "sha256",
+) -> str:
+    file_path = Path(file_path)
+
+    with open(file_path, "rb") as f:
+        try:
+            digest = hashlib.file_digest(f, algorithm)
+            return digest.hexdigest()
+        except AttributeError:
+            h = hashlib.new(algorithm)
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            return h.hexdigest()
+
+
+def generate_image_hash_no_metadata(
+    file_path: str | Path,
+    algorithm: str = "sha256",
+) -> str:
+    file_path = Path(file_path)
+
+    with Image.open(file_path) as img:
+        # Re-save without metadata into RAM
+        buf = io.BytesIO()
+        img.save(buf, format=img.format)
+        buf.seek(0)
+
+        h = hashlib.new(algorithm)
+        for chunk in iter(lambda: buf.read(1024 * 1024), b""):
+            h.update(chunk)
+
+        return h.hexdigest()
+
+
+def generate_hash_ignore_metadata(file_path: Path, algorithm: str = "sha256",) -> str:
     """
-    Generate a hexadecimal hash for a file.
-
-    Works with Python >=3.6. If running on Python >=3.11, uses
-    `hashlib.file_digest` for optimal performance. Otherwise,
-    reads the file in chunks to avoid memory issues with large files.
-
-    Args:
-        file_path: Path to the file (str or Path).
-        algorithm: Hash algorithm name (e.g., 'sha256', 'md5').
-
-    Returns:
-        Hexadecimal string of the file hash.
-
-    Raises:
-        FileNotFoundError: if the file does not exist.
-        ValueError: if the algorithm is not supported.
-        OSError: if reading the file fails.
+    Generate a hash for a file, ignoring any metadata.
     """
     file_path = Path(file_path)
-    if not file_path.is_file():
-        raise FileNotFoundError(f"File does not exist: {file_path}")
+    mime, _ = mimetypes.guess_type(str(file_path))
 
-    # logger.debug(f"Generating hash for {json.dumps(str(file_path))} using {algorithm}...")
-    try:
-        with open(file_path, "rb") as f:
-            # Python 3.11+ optimal path
-            try:
-                digest = hashlib.file_digest(f, algorithm)
-                hexd = digest.hexdigest()
-            except AttributeError:
-                # Fallback for older Python: read in chunks
-                h = hashlib.new(algorithm)
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-                hexd = h.hexdigest()
-    except Exception as e:
-        logger.exception(f"Failed to generate hash for {file_path}: {e}")
-        raise
+    if mime and mime.startswith("image/"):
+        return generate_image_hash_no_metadata(file_path, algorithm)
 
-    # logger.debug(f"Generated hash {json.dumps(str(hexd))} for {file_path}")
-    return hexd
+    # everything else: raw hash
+    return generate_file_hash(file_path, algorithm)
 
 
 def date_string_to_unix_nanos(date_str: str) -> int:
@@ -352,10 +368,10 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
         try:
             modified_time, created_time, size = get_file_data(full_file_path)
-            properties = get_windows_details(full_file_path)
-            date_taken = properties.get("Date taken", None)
-            if date_taken is not None:
-                date_taken = date_string_to_unix_nanos(date_taken)
+            # properties = get_windows_details(full_file_path)
+            # date_taken = properties.get("Date taken", None)
+            # if date_taken is not None:
+            #     date_taken = date_string_to_unix_nanos(date_taken)
         except Exception:
             logger.exception(f"Failed to get file stats for {json.dumps(str(full_file_path.as_posix()))}. Skipping.")
             continue
@@ -364,6 +380,7 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
         old_entry = cache["files"].get(full_file_path.as_posix())
         needs_update = (
             old_entry is None or
+            # old_entry.get("date_taken") != date_taken or
             old_entry.get("modified_time") != modified_time or
             old_entry.get("created_time") != created_time or
             old_entry.get("size") != size
@@ -371,12 +388,13 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
         if needs_update:
             try:
-                file_hash = generate_hash(full_file_path)
+                file_hash = generate_hash_ignore_metadata(full_file_path)
             except Exception:
                 logger.warning(f"Failed to generate hash for {json.dumps(str(full_file_path.as_posix()))}. Skipping.")
                 continue
 
             cache["files"][full_file_path.as_posix()] = {
+                # "date_taken": date_taken,
                 "modified_time": modified_time,
                 "created_time": created_time,
                 "size": size,
@@ -429,6 +447,7 @@ def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
 
         # Criteria: Created (asc), Modified (asc), Size (desc via negation)
         sort_key = (
+            # file_data.get("date_taken") or 0,
             file_data.get("created_time") or 0,
             file_data.get("modified_time") or 0,
             -abs(file_data.get("size") or 0),
@@ -518,7 +537,7 @@ def remove_duplicates(cache: dict, cache_file: Path) -> None:
         # logger.debug(f"{file_entries=}")
         if len(file_entries) > 1:
             for path in list(file_entries.keys())[1:]:
-                logger.debug(f"{path=}")
+                # logger.debug(f"{path=}")
                 path = Path(path)
                 if path.exists():
                     was_recycled_successfully = send_to_recycle_bin(path)
@@ -560,7 +579,7 @@ def main(config) -> None:
     cache = build_hashes_cache(cache, cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    remove_duplicates(cache, cache_file)
+    # remove_duplicates(cache, cache_file)
 
 
 def format_duration_long(duration_seconds: float) -> str:
