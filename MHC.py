@@ -273,10 +273,7 @@ def get_file_data(file_path: Path | str) -> tuple[int, int, int]:
     return mtime, ctime, size
 
 
-def generate_file_hash(
-    file_path: str | Path,
-    algorithm: str = "sha256",
-) -> str:
+def generate_file_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
     file_path = Path(file_path)
 
     with open(file_path, "rb") as f:
@@ -290,10 +287,7 @@ def generate_file_hash(
             return h.hexdigest()
 
 
-def generate_image_hash_no_metadata(
-    file_path: str | Path,
-    algorithm: str = "sha256",
-) -> str:
+def generate_image_hash_no_metadata(file_path: str | Path, algorithm: str = "sha256") -> str:
     file_path = Path(file_path)
 
     with Image.open(file_path) as img:
