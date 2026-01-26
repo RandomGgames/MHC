@@ -389,7 +389,7 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
         # Log a progress message every second
         if time.time() - time_since_last_processing_messsage >= 1:
-            logger.info(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
+            logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
             time_since_last_processing_messsage = time.time()
         # if files_scanned % 5000 == 0:
         #     logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
@@ -398,55 +398,46 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
     if changes_since_save > 0:
         save_cache(cache, cache_file)
 
-    logger.info(f"Finished building files cache. Scanned {len(cache['files'])} files, made {total_changes} changes.")
+    logger.info(f"Finished building files cache. Scanned {files_scanned} files, made {total_changes} changes.")
     return cache
 
 
 def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
     """
     Build a hashes index: { hash: { path: data } }
-    Sorted by: Created (oldest), Modified (oldest), Size (largest).
+    Preserves original file discovery order without explicit sorting.
     """
-    logger.info("Building hashes cache...")
+    logger.debug("Building hashes cache...")
     cache_file = Path(cache_file)
 
     old_hashes = cache.get("hashes", {})
-    temp_grouping = {}
-
+    final_hashes = {}
     total_changes = 0
 
+    # 1. Group files by their hash
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data.get("hash")
         if not file_hash:
             continue
 
-        # Criteria: Created (asc), Modified (asc), Size (desc via negation)
-        sort_key = (
-            # file_data.get("date_taken") or 0,
-            file_data.get("created_time") or 0,
-            file_data.get("modified_time") or 0,
-            -abs(file_data.get("size") or 0),
-        )
-        temp_grouping.setdefault(file_hash, []).append((sort_key, file_path, file_data))
+        # Ensure the hash key exists, then add the file data to its sub-dictionary
+        if file_hash not in final_hashes:
+            final_hashes[file_hash] = {}
 
-    final_hashes = {}
-    for file_hash, entries in temp_grouping.items():
-        entries.sort(key=lambda e: e[0])  # Sort based on the sort_key tuple
-        ordered_sub_dict = {path: data for _, path, data in entries}  # Build inner dict (Insertion order follows the sort)
-        # Check against old cache for reporting
+        final_hashes[file_hash][file_path] = file_data
+
+    # 2. Check against old cache for reporting changes. We do this in a separate loop to ensure all hashes are fully built first
+    for file_hash, ordered_sub_dict in final_hashes.items():
         old_val = old_hashes.get(file_hash)
-        if old_val is None:
+        if old_val is None or old_val != ordered_sub_dict:
             total_changes += 1
-        elif old_val != ordered_sub_dict:
-            total_changes += 1
-        final_hashes[file_hash] = ordered_sub_dict
+
     cache["hashes"] = final_hashes
 
     if total_changes > 0:
-        save_cache(cache, cache_file)
-        logger.info(f"Hashes cache updated. Updated {total_changes} hashes.")
+        logger.debug(f"Hashes cache updated. Made {total_changes} changes.")
     else:
-        logger.info("No changes detected in hashes cache.")
+        logger.debug("No changes detected in hashes cache.")
 
     return cache
 
@@ -513,6 +504,65 @@ def remove_duplicates(cache: dict, cache_file: Path) -> None:
     save_cache(cache, cache_file)
 
 
+def build_folders_cache(cache: dict, cache_file: Path) -> dict:
+    """
+    Build a folders index: { folder: { path: data } }
+    Sorted by: Created (oldest), Modified (oldest), Size (largest).
+    """
+    logger.debug("Building folders cache... (This may take a while, please be patient)")
+    cache_file = Path(cache_file)
+
+    total = 0
+    cache.setdefault("folders", [])
+    for file_path in cache.get("files", {}).keys():
+        file_path = Path(file_path)
+        file_dir = file_path.parent
+        if file_dir not in cache["folders"]:
+            cache["folders"].append(file_dir)
+            total += 1
+    # cache["folders"].sort(key=lambda f: f.lower())
+    logger.debug(f"Built folders cache. Found {total} folders.")
+    return cache
+
+
+def sanitize_paths(data):
+    """
+    Recursively converts pathlib.Path objects to posix strings.
+    Handles dictionaries and lists.
+    """
+    if isinstance(data, dict):
+        return {k: sanitize_paths(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [sanitize_paths(i) for i in data]
+    if isinstance(data, Path):
+        return data.as_posix()
+    return data
+
+
+def build_hashes_by_priority_cache(cache: dict, duplicates_keep_folder_priority) -> dict:
+    logger.debug("Building hashes_by_priority cache... (This may take a while, please be patient)")
+    cache["hashes_by_priority"] = {}
+    for hash_val, files in cache["hashes"].items():
+        if len(files.keys()) > 1:
+            files = list(Path(f) for f in files)
+            file_to_keep = None
+            for priority_folder in duplicates_keep_folder_priority:
+                priority_path = Path(priority_folder)
+                # Check if any file in the current hash group lives in this folder
+                file_to_keep = next((f for f in files if f.parent == priority_path), None)
+                if file_to_keep:
+                    break
+            if not file_to_keep:
+                file_to_keep = files[0]
+            files_to_remove = [f for f in files if f != file_to_keep]
+
+            cache["hashes_by_priority"][hash_val] = {
+                "highest": file_to_keep,
+                "lower": files_to_remove
+            }
+    return cache
+
+
 def main(config) -> None:
     # logger.debug(f"Config: {json.dumps(config, indent=4)}")
 
@@ -534,16 +584,36 @@ def main(config) -> None:
         raise ValueError
     # logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
 
+    duplicates_keep_folder_priority = list(config.get("duplicates_keep_folder_priority"))
+    try:
+        duplicates_keep_folder_priority = [Path(p) for p in duplicates_keep_folder_priority]
+    except TypeError:
+        logger.error("duplicates_keep_folder_priority must be a list of file paths in config.")
+        raise
+
     cache = load_cache(cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    cache = purge_cache(cache)
+    # cache = purge_cache(cache)
+    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    cache = build_files_cache(cache, cache_file, media_root, media_extensions)
+    # cache = build_files_cache(cache, cache_file, media_root, media_extensions)
+    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+
     cache = build_hashes_cache(cache, cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    # remove_duplicates(cache, cache_file)
+    cache = build_folders_cache(cache, cache_file)
+    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+
+    missing_folders_from_config = [folder for folder in cache["folders"] if folder not in duplicates_keep_folder_priority]
+    if len(missing_folders_from_config) > 0:
+        str_missing_folders_from_config = [str(p) for p in missing_folders_from_config]
+        logger.warning(f"Missing folders from config: {json.dumps(str_missing_folders_from_config, indent=4)}")
+        raise ValueError("Missing folders from config in duplicates_keep_folder_priority. They must be added to properly remove duplicates.")
+
+    cache = build_hashes_by_priority_cache(cache, duplicates_keep_folder_priority)
+    logger.debug(f"Cache: {json.dumps(sanitize_paths(cache), indent=4)}")
 
 
 def format_duration_long(duration_seconds: float) -> str:
