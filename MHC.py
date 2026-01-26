@@ -1,46 +1,24 @@
-# pylint: disable=no-member
 """
 A python script that hashes media and assists in removing duplicates.
 """
 
-# import bisect
-# import cv2
-# import exiftool
 import hashlib
-# import imagehash
 import io
 import json
-# import librosa
 import logging
 import mimetypes
-# import numpy as np
 import os
 import re
 import send2trash
-# import shutil
 import socket
 import sys
 import time
-# import tkinter
-# import tkinter.messagebox
-# import toml
 import tomllib
-# import traceback
-# import typing
 import win32com.client
-# import zipfile
 from datetime import datetime
-# from hachoir.metadata import extractMetadata
-# from hachoir.parser import createParser
-# from imagehash import hex_to_hash
-# from itertools import islice
 from pathlib import Path
 from PIL import Image
-# from PIL import ImageOps
-# from PIL import ImageTk
-# from PIL.ExifTags import TAGS
 from typing import Iterable, Pattern
-
 
 logger = logging.getLogger(__name__)
 
