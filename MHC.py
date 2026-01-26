@@ -194,8 +194,8 @@ def find_files(root: Path | str, *, recursive: bool = True, include: list[str | 
         pathlib.Path objects for files matching the include/ignore criteria.
 
     Raises:
-        FileNotFoundError: If `root` does not exist.
-        ValueError: If `root` is not a directory.
+        FileNotFoundError: If "root" does not exist.
+        ValueError: If "root" is not a directory.
     """
     root = Path(root)
     if not root.exists():
@@ -310,9 +310,9 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
     Scan media files and update the cache with metadata and hashes.
 
     Features:
-        - Uses `find_files` with regex-based include filters
+        - Uses "find_files" with regex-based include filters
         - Purges non-existent files before scanning
-        - Saves periodically every `checkpoint` changes
+        - Saves periodically every "checkpoint" changes
         - Saves at the end if there are unsaved changes
         - Handles hash/read errors gracefully
 
@@ -323,19 +323,18 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
         media_extensions: List of regex strings or compiled patterns for files to include.
         checkpoint: Number of changes before saving a partial cache.
     """
-    logger.info("Building files cache...")
+    logger.info("Building files cache... (This may take a while, please be patient)")
 
     cache.setdefault("files", {})
     cache.setdefault("hashes", {})
 
-    # Purge entries for missing files
-    cache_file = Path(cache_file)
-    cache = purge_cache(cache)
-
     changes_since_save = 0
     total_changes = 0
+    time_since_last_processing_messsage = time.time()
+    files_scanned = 0
 
     for file_path in find_files(media_root, recursive=True, include=media_extensions):
+        files_scanned += 1
         full_file_path = Path(file_path).resolve()
 
         try:
@@ -380,19 +379,26 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
             changes_since_save += 1
             total_changes += 1
-        else:
-            logger.debug(f"No changes detected for {json.dumps(str(full_file_path.as_posix()))}.")
+        # else:
+            # logger.debug(f"No changes detected for {json.dumps(str(full_file_path.as_posix()))}.")
 
-        # Checkpoint save every `checkpoint` changes
+        # Checkpoint save every "checkpoint" changes
         if changes_since_save >= save_cache_every:
             save_cache(cache, cache_file)
             changes_since_save = 0
+
+        # Log a progress message every second
+        if time.time() - time_since_last_processing_messsage >= 1:
+            logger.info(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
+            time_since_last_processing_messsage = time.time()
+        # if files_scanned % 5000 == 0:
+        #     logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
 
     # Final save for any remaining changes
     if changes_since_save > 0:
         save_cache(cache, cache_file)
 
-    logger.info(f"Finished building files cache. Total Files: {len(cache['files'])}. Total changes: {total_changes}")
+    logger.info(f"Finished building files cache. Scanned {len(cache['files'])} files, made {total_changes} changes.")
     return cache
 
 
@@ -407,11 +413,8 @@ def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
     old_hashes = cache.get("hashes", {})
     temp_grouping = {}
 
-    added = 0
-    modified = 0
-    removed = 0
+    total_changes = 0
 
-    # 1. Group files by hash
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data.get("hash")
         if not file_hash:
@@ -426,35 +429,22 @@ def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
         )
         temp_grouping.setdefault(file_hash, []).append((sort_key, file_path, file_data))
 
-    # 2. Sort and build the ordered dictionary
     final_hashes = {}
     for file_hash, entries in temp_grouping.items():
-        # Sort based on the sort_key tuple
-        entries.sort(key=lambda e: e[0])
-
-        # Build inner dict (Insertion order follows the sort)
-        ordered_sub_dict = {path: data for _, path, data in entries}
-
+        entries.sort(key=lambda e: e[0])  # Sort based on the sort_key tuple
+        ordered_sub_dict = {path: data for _, path, data in entries}  # Build inner dict (Insertion order follows the sort)
         # Check against old cache for reporting
         old_val = old_hashes.get(file_hash)
         if old_val is None:
-            added += 1
+            total_changes += 1
         elif old_val != ordered_sub_dict:
-            modified += 1
-
+            total_changes += 1
         final_hashes[file_hash] = ordered_sub_dict
-
-    # 3. Detect removals
-    removed_hashes = set(old_hashes) - set(final_hashes)
-    removed = len(removed_hashes)
-
-    # 4. Finalize
-    total_changes = added + modified + removed
     cache["hashes"] = final_hashes
 
     if total_changes > 0:
         save_cache(cache, cache_file)
-        logger.info(f"Hashes cache updated. Changes: {total_changes} ({added} added, {modified} modified, {removed} removed).")
+        logger.info(f"Hashes cache updated. Updated {total_changes} hashes.")
     else:
         logger.info("No changes detected in hashes cache.")
 
@@ -471,13 +461,13 @@ def purge_cache(cache: dict) -> dict:
     Returns:
         The cleaned cache dictionary.
     """
+    logger.debug("Purging cache...")
     if "files" in cache:
         for file_path_str in list(cache["files"].keys()):
             file_path = Path(file_path_str)
             if not file_path.exists():
                 cache["files"].pop(file_path_str, None)
                 logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
-
     return cache
 
 
@@ -546,6 +536,8 @@ def main(config) -> None:
 
     cache = load_cache(cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+
+    cache = purge_cache(cache)
 
     cache = build_files_cache(cache, cache_file, media_root, media_extensions)
     cache = build_hashes_cache(cache, cache_file)
