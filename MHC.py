@@ -172,7 +172,7 @@ def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
-        logger.debug("Saved cache.")
+        logger.info("Saved cache.")
     except Exception:
         logger.exception("Failed to save cache.")
         raise
@@ -389,7 +389,7 @@ def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, med
 
         # Log a progress message every second
         if time.time() - time_since_last_processing_messsage >= 1:
-            logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
+            logger.info(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
             time_since_last_processing_messsage = time.time()
         # if files_scanned % 5000 == 0:
         #     logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
@@ -476,32 +476,25 @@ def send_to_recycle_bin(path: Path) -> bool:
         logger.info(f"Sent {json.dumps(str(path.as_posix()))} to recycle bin.")
         return True
     except OSError:
-        logger.error(f"Failed to send {json.dumps(str(path.as_posix()))} to recycle bin.")
-        return False
+        logger.exception(f"Failed to send {json.dumps(str(path.as_posix()))} to recycle bin.")
+        raise
 
 
-def remove_duplicates(cache: dict, cache_file: Path) -> None:
+def remove_duplicates(cache: dict) -> None:
     """
     Sends any duplicate files to the recycle bin and removes them from the cache
     """
     deleted_files = 0
-    for hash_val, file_entries in cache.get("hashes", {}).items():
-        # logger.debug(f"{hash_val=}")
-        # logger.debug(f"{file_entries=}")
-        if len(file_entries) > 1:
-            for path in list(file_entries.keys())[1:]:
-                # logger.debug(f"{path=}")
-                path = Path(path)
-                if path.exists():
-                    was_recycled_successfully = send_to_recycle_bin(path)
-                    if was_recycled_successfully:
-                        cache["files"].pop(path.resolve().as_posix(), None)
-                        # logger.debug(f"Removed duplicate file from cache: {json.dumps(str(path.as_posix()))}")
-                        cache["hashes"][hash_val].pop(path.resolve().as_posix(), None)
-                        # logger.debug(f"Removed duplicate file from hashes: {json.dumps(str(path.as_posix()))}")
-                        deleted_files += 1
-    logger.info(f"Removed {deleted_files} duplicate files from cache.")
-    save_cache(cache, cache_file)
+    for hash_val, data in cache.get("hashes_by_priority", {}).items():
+        files_to_delete = data.get("lower", [])
+        for file_to_delete in files_to_delete:
+            logger.debug(f"file_to_delete = {json.dumps(str(file_to_delete))}")
+            try:
+                send_to_recycle_bin(file_to_delete)
+                deleted_files += 1
+            except:
+                pass
+    logger.info(f"Removed {deleted_files} duplicate files.")
 
 
 def build_folders_cache(cache: dict, cache_file: Path) -> dict:
@@ -594,10 +587,10 @@ def main(config) -> None:
     cache = load_cache(cache_file)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    # cache = purge_cache(cache)
+    cache = purge_cache(cache)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    # cache = build_files_cache(cache, cache_file, media_root, media_extensions)
+    cache = build_files_cache(cache, cache_file, media_root, media_extensions)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
     cache = build_hashes_cache(cache, cache_file)
@@ -613,7 +606,9 @@ def main(config) -> None:
         raise ValueError("Missing folders from config in duplicates_keep_folder_priority. They must be added to properly remove duplicates.")
 
     cache = build_hashes_by_priority_cache(cache, duplicates_keep_folder_priority)
-    logger.debug(f"Cache: {json.dumps(sanitize_paths(cache), indent=4)}")
+    # logger.debug(f"Cache: {json.dumps(sanitize_paths(cache), indent=4)}")
+
+    remove_duplicates(cache)
 
 
 def format_duration_long(duration_seconds: float) -> str:
