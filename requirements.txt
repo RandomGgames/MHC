@@ -1,2 +1,3 @@
-send2trash
-toml
+Send2Trash
+pillow
+pywin32

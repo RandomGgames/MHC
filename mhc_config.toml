@@ -1,0 +1,42 @@
+cache_file = "cache.json"
+media_dir = "./media"
+# Must be regex searches. By defailt, the searches provided
+# - Check for the file type at the end, ignoring the case (PNG or png are both accepted)
+# - Ensure $ is not contained after a / or \ for system files
+media_extensions = [
+    # Video
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.avi$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.flv$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.m4v$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.mkv$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.mov$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.mp4$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.mpeg$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.mpg$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.webm$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.wmv$",
+
+    # Image
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.bmp$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.gif$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.heic$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.heif$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.jpe?g$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.png$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.tiff?$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.webp$",
+    "(?i)^(?!.*[\\\\/][^\\\\/]*\\$).*\\.avif$",
+]
+ignore_files_with = ["$", "System"]
+duplicates_keep_folder_priority = []
+
+[exit_behavior]
+always_pause = false
+pause_on_error = true
+
+[logging]
+console_logging_level = "DEBUG"                                                           # DEBUG, INFO, WARNING, ERROR
+file_logging_level = "DEBUG"                                                              # DEBUG, INFO, WARNING, ERROR
+log_message_format = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
+logs_folder_name = "logs"
+max_log_files = 50
