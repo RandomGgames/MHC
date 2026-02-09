@@ -559,44 +559,51 @@ def build_hashes_by_priority_cache(cache: dict, duplicates_keep_folder_priority)
 def main(config) -> None:
     # logger.debug(f"Config: {json.dumps(config, indent=4)}")
 
-    cache_file = Path(str(config.get("cache_file")))
-    if cache_file is None:
+    cache_file_path = config.get("cache_file", None)
+    if cache_file_path is None:
         logger.error("No cache file specified in config.")
         raise ValueError
+    cache_file_path = Path(str(cache_file_path))
     # logger.debug(f"Cache file: {json.dumps(str(cache_file))}")
 
-    media_root = Path(str(config.get("media_dir")))
-    if media_root is None:
+    media_root_path = config.get("media_dir", None)
+    if media_root_path is None:
         logger.error("No media root specified in config.")
         raise ValueError
+    media_root_path = Path(str(media_root_path))
     # logger.debug(f"Media root: {json.dumps(str(media_root))}")
 
-    media_extensions = list(config.get("media_extensions"))
+    media_extensions = config.get("media_extensions", None)
     if media_extensions is None:
         logger.error("No media extensions specified in config.")
         raise ValueError
+    media_extensions = list(media_extensions)
     # logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
 
-    duplicates_keep_folder_priority = list(config.get("duplicates_keep_folder_priority"))
-    try:
-        duplicates_keep_folder_priority = [Path(p) for p in duplicates_keep_folder_priority]
-    except TypeError:
-        logger.error("duplicates_keep_folder_priority must be a list of file paths in config.")
-        raise
+    duplicates_keep_folder_priority = config.get("duplicates_keep_folder_priority", None)
+    if duplicates_keep_folder_priority is not None:
+        try:
+            duplicates_keep_folder_priority = list(duplicates_keep_folder_priority)
+            duplicates_keep_folder_priority = [Path(p) for p in duplicates_keep_folder_priority]
+        except TypeError:
+            logger.error("duplicates_keep_folder_priority must be a list of file paths in config.")
+            raise
+    else:
+        logger.error("duplicates_keep_folder_priority is missing from config.")
 
-    cache = load_cache(cache_file)
+    cache = load_cache(cache_file_path)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
     cache = purge_cache(cache)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    cache = build_files_cache(cache, cache_file, media_root, media_extensions)
+    cache = build_files_cache(cache, cache_file_path, media_root_path, media_extensions)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    cache = build_hashes_cache(cache, cache_file)
+    cache = build_hashes_cache(cache, cache_file_path)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
-    cache = build_folders_cache(cache, cache_file)
+    cache = build_folders_cache(cache, cache_file_path)
     # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
 
     missing_folders_from_config = [folder for folder in cache["folders"] if folder not in duplicates_keep_folder_priority]
