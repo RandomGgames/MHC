@@ -18,6 +18,7 @@ media_extensions = [
     "(?i)\\.bmp$",
 ]
 ignore_files_with = ["$", "System"]
+duplicates_keep_folder_priority = []
 
 [exit_behavior]
 always_pause = false
