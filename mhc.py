@@ -199,11 +199,6 @@ def load_config(file_path: Path) -> Config:
     return config
 
 
-def save_config(file_path: Path, config_data: dict | list) -> bool:
-    """Alias for write_json_file, specifically for configuration files."""
-    return write_json_file(file_path, config_data)
-
-
 def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
     """
     Enforce a maximum number of log files for this script.
