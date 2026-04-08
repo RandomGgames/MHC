@@ -9,12 +9,15 @@ on a keep priority, deletes duplicates.
 {How to use the script}
 """
 
+import cv2
 import hashlib
+import imagehash
 import io
 import json
 import logging
 import logging.handlers
 import mimetypes
+import numpy as np
 import os
 import platform
 import re
@@ -31,6 +34,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from PIL import Image
+from pillow_heif import register_heif_opener
 from typing import Iterable, Pattern
 
 logger = logging.getLogger(__name__)
@@ -47,10 +51,28 @@ log_buffer = logging.handlers.MemoryHandler(
 logger.addHandler(log_buffer)
 logger.setLevel(logging.DEBUG)
 
+register_heif_opener()
+
 
 @dataclass
 class ScriptSettings:
-    """Place any code for whatever script is being writen here"""
+    IMAGE_EXTENSIONS = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+        ".tiff",
+        ".heic",
+        ".heif"
+    }
+    VIDEO_EXTENSIONS = {
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".webm"
+    }
 
 
 @dataclass
@@ -81,6 +103,77 @@ class Config:
     script: ScriptSettings = field(default_factory=ScriptSettings)
     logs: LogSettings = field(default_factory=LogSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+
+
+def hash_image_file(path, hash_size=16):
+    """
+    Compute a perceptual hash for a single image file.
+    Supports HEIC and standard image formats.
+
+    Returns:
+        np.ndarray: binary hash array or None if failed
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    try:
+        img = Image.open(path).convert("L")
+        h = imagehash.phash(img, hash_size=hash_size)
+        return np.array(h.hash).astype(np.uint8)
+    except Exception as e:
+        print(f"Error hashing image {path}: {e}")
+        return None
+
+
+def hash_video_file(path, hash_size=16, num_frames=8):
+    """
+    Compute a perceptual hash for a video file by sampling frames.
+
+    Returns:
+        np.ndarray: median hash array or None if failed
+    """
+    ext = os.path.splitext(path)[1].lower()
+
+    cap = cv2.VideoCapture(path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        cap.release()
+        return None
+
+    frame_idxs = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    hashes = []
+
+    for idx in frame_idxs:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        # Convert to PIL image
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame).convert("L")
+        h = imagehash.phash(pil_img, hash_size=hash_size)
+        hashes.append(np.array(h.hash).astype(np.uint8))
+
+    cap.release()
+    if not hashes:
+        return None
+
+    # Median aggregation across frames
+    return np.median(hashes, axis=0).astype(np.uint8)
+
+
+def hash_distance(h1, h2):
+    """
+    Compute Hamming distance between two hashes (images or videos)
+    """
+    return np.sum(h1 != h2)
+
+
+def is_similar(h1, h2, threshold=4):
+    """
+    Check if two hashes are similar based on a threshold.
+    """
+    return hash_distance(h1, h2) <= threshold
 
 
 def main():
