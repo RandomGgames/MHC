@@ -1,798 +1,560 @@
 """
-A python script that hashes media and assists in removing duplicates.
+{Script Name}
+
+{Summary of what the script does}
+
+{How to use the script}
 """
 
-import hashlib
-import io
+import cv2
+import imagehash
 import json
 import logging
-import mimetypes
+import logging.handlers
 import os
-import re
-import send2trash
+import platform
 import socket
 import sys
-import time
-import tomllib
-import win32com.client
+import tempfile
+import typing
+from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from PIL import Image
-from typing import Iterable, Pattern
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.1.0"  # Major.Minor.Patch
+__version__ = "1.2.0"  # Major.Minor.Patch
+
+logger = logging.getLogger(__name__)
+log_buffer = logging.handlers.MemoryHandler(
+    capacity=0,
+    flushLevel=logging.CRITICAL,
+    target=None,
+)
+logger.addHandler(log_buffer)
+logger.setLevel(logging.DEBUG)
+
+cache = {}
 
 
-def read_toml(file_path: Path | str) -> dict:
-    """
-    Reads a TOML file and returns its contents as a dictionary.
+@dataclass
+class ScriptSettings:
+    media_dir_path = Path(r"H:\Media Backup")
+    cache_file_path = Path(r"cache.json")
+    save_cache_frequency = 100  # files scanned
+    ignore_files_containing = ["$", "System"]
+    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+    video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
 
-    Args:
-        file_path (Path | str): The file path of the TOML file to read.
 
-    Returns:
-        dict: The contents of the TOML file as a dictionary.
+@dataclass
+class LogSettings:
+    mode: typing.Literal["per_run", "latest", "per_day", "single_file", "ConsoleOnly"] = "per_day"
+    folder: Path = Path(r"Logs")
+    console_level: int = logging.DEBUG
+    file_level: int = logging.DEBUG
+    date_format: str = "%Y-%m-%d %H:%M:%S"
+    message_format: str = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
+    max_files: int | None = 10
+    open_log_after_run: bool = False
 
-    Raises:
-        FileNotFoundError: If the TOML file does not exist.
-        OSError: If the file cannot be read.
-        tomllib.TOMLDecodeError (or toml.TomlDecodeError): If the file is invalid TOML.
-    """
-    path = Path(file_path)
 
-    if not path.is_file():
-        raise FileNotFoundError(f"File not found: {json.dumps(str(path))}")
+@dataclass
+class InternalSettings:
+    use_config_file: bool = False
 
+
+@dataclass
+class RuntimeSettings:
+    pause_on_error: bool = True
+    always_pause: bool = False
+
+
+@dataclass
+class Config:
+    script: ScriptSettings = field(default_factory=ScriptSettings)
+    logs: LogSettings = field(default_factory=LogSettings)
+    runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+
+
+class HashGenerationError(Exception):
+    """Custom exception for media hashing failures."""
+    pass
+
+
+def generate_fast_hash(file_path: Path, image_exts: set, video_exts: set):
+    ext = file_path.suffix.lower()
+
+    if ext in image_exts:
+        return get_fast_image_hash(file_path)
+    if ext in video_exts:
+        return get_fast_video_hash(file_path)
+
+    raise HashGenerationError(f"Unsupported file extension: {ext}")
+
+
+def get_fast_image_hash(file_path: Path):
     try:
-        # Read TOML as bytes
-        with path.open("rb") as f:
-            data = tomllib.load(f)  # Replace with 'toml.load(f)' if using the toml package
-        return data
-
-    except (OSError, tomllib.TOMLDecodeError):
-        logger.exception(f"Failed to read TOML file: {json.dumps(str(file_path))}")
+        with Image.open(file_path) as img:
+            img = img.convert("L").resize((32, 32), Image.Resampling.NEAREST)
+            return str(imagehash.phash(img))
+    except Exception as e:
+        logger.error("Image hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
         raise
 
 
-def get_windows_details(file_path: str | Path, max_columns: int = 512) -> dict[str, str]:
-    """
-    Return Windows 'Details' tab properties for a file using the Shell Property System.
+def get_fast_video_hash(file_path: Path):
+    cap = cv2.VideoCapture(str(file_path.resolve()))
 
-    - Windows only.
-    - Requires pywin32: pip install pywin32
-    - Keys are localized to the OS display language, matching File Explorer.
-    - Values are formatted like Explorer shows them.
-
-    Args:
-        file_path: Target file.
-        max_columns: Maximum number of property columns to probe.
-
-    Returns:
-        Dict of {property_label: value} for all non-empty properties.
-    """
-    p = Path(file_path)
-    if not p.exists():
-        raise FileNotFoundError(p)
-    if os.name != "nt":
-        raise OSError("get_windows_details is only supported on Windows")
-
-    # Bind to Shell
-    shell = win32com.client.Dispatch("Shell.Application")
-    folder = shell.NameSpace(str(p.parent))
-    if folder is None:
-        raise RuntimeError(f"Shell.NameSpace failed for {p.parent}")
-    item = folder.ParseName(p.name)
-    if item is None:
-        raise RuntimeError(f"Shell.ParseName failed for {p}")
-
-    props: dict[str, str] = {}
-    blanks = 0
-
-    for i in range(max_columns):
-        header = folder.GetDetailsOf(None, i)
-        if not header:
-            blanks += 1
-            if blanks >= 25:
-                break
-            continue
-        blanks = 0
-
-        value = folder.GetDetailsOf(item, i)
-        if isinstance(value, str):
-            value = value.strip()
-        if value:
-            props[str(header).strip()] = str(value)
-
-    return props
-
-
-def load_cache(path: Path = Path("cache.json")) -> dict:
-    """
-    Loads a cache from the given path.
-
-    Args:
-    path (typing.Union[pathlib.Path, str], optional): The path of the cache file to load. Defaults to "cache.json".
-
-    Returns:
-    dict: The loaded cache.
-    """
-    path = Path(path)
-    logger.debug(f"Loading cache file {json.dumps(str(path))}...")
-
-    data = {}
-    if path.exists():
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                logger.debug("Loaded cache.")
-        except json.JSONDecodeError:
-            logger.exception("Failed to decode cache file. Using empty cache.")
-        except OSError:
-            logger.exception("Failed to read cache file. Using empty cache.")
-    else:
-        logger.info("Cache file does not exist. Using empty cache.")
-
-    return data
-
-
-def ensure_dir(path: Path) -> None:
-    """Ensures the parent directory for a given file path exists."""
-    path = Path(path).resolve()
-
-    # If the path doesn't exist, we assume it's a file if it has an extension.
-    # Otherwise, if it's already a file, we want its parent.
-    if path.suffix or path.is_file():
-        path = path.parent
+    if not cap.isOpened():
+        logger.error("OpenCV could not open %s", json.dumps(str(file_path.as_posix())))
+        raise HashGenerationError("OpenCV open failure")
 
     try:
-        # exist_ok=True replaces the manual 'if not path.exists()' check
-        if not path.exists():
-            path.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Created {json.dumps(str(path))}")
-    except OSError:
-        logger.error(f"Error creating directory {json.dumps(str(path))}")
+        success, frame = cap.read()
+        if not success or frame is None:
+            logger.error("Could not read frame from %s", json.dumps(str(file_path.as_posix())))
+            raise HashGenerationError("Frame read failure")
+
+        small_frame = cv2.resize(frame, (32, 32), interpolation=cv2.INTER_NEAREST)
+        gray_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        img = Image.fromarray(gray_frame)
+        return str(imagehash.phash(img))
+    except Exception as e:
+        logger.error("Video hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
         raise
+    finally:
+        cap.release()
 
 
-def save_cache(data: dict, path: Path = Path("cache.json")) -> None:
+def iter_media_files(media_dir: Path, valid_exts: set, ignore_files_containing: list, resolve_path: bool = False):
     """
-    Saves the given cache data to the specified path.
+    Scans media_dir recursively and yields valid Path objects.
 
-    Args:
-        data (dict): The cache data to save.
-        path (str | Path, optional): The path of the cache file to save. Defaults to "cache.json".
+    - valid_exts: A set of lowercase extensions like {'.jpg', '.mp4'}
+    - ignore_list: A list of strings to check against the full file path.
     """
-    path = Path(path)
-    logger.debug(f"Saving cache to {json.dumps(str(path))}...")
-
-    try:
-        ensure_dir(path)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-
-        logger.info("Saved cache.")
-    except Exception:
-        logger.exception("Failed to save cache.")
-        raise
-
-
-def find_files(root: Path | str, *, recursive: bool = True, include: list[str | Pattern] | None = None, ignore: list[str | Pattern] | None = None) -> Iterable[Path]:
-    """
-    Yield files in a directory filtered by regex-based include and ignore patterns.
-
-    Args:
-        root: Directory path to search.
-        recursive: If True, search all subdirectories.
-        include: List of regex strings or compiled patterns. Only files matching
-            at least one pattern are included. If None, all files are included.
-        ignore: List of regex strings or compiled patterns. Files matching any
-            pattern are skipped.
-
-    Yields:
-        pathlib.Path objects for files matching the include/ignore criteria.
-
-    Raises:
-        FileNotFoundError: If "root" does not exist.
-        ValueError: If "root" is not a directory.
-    """
-    root = Path(root)
-    if not root.exists():
-        raise FileNotFoundError(f"Root path does not exist: {root}")
-    if not root.is_dir():
-        raise ValueError(f"Expected a directory, got: {root}")
-
-    # Compile regexes if needed
-    include_patterns: list[Pattern] = [
-        re.compile(p) if isinstance(p, str) else p for p in (include or [])
-    ]
-    ignore_patterns: list[Pattern] = [
-        re.compile(p) if isinstance(p, str) else p for p in (ignore or [])
-    ]
-
-    iterator = root.rglob("*") if recursive else root.glob("*")
-    for path in iterator:
+    # rglob('*') finds everything recursively
+    for path in media_dir.rglob("*"):
         if not path.is_file():
             continue
 
-        path_str = str(path)
-
-        # Skip files matching any ignore pattern
-        if any(p.search(path_str) for p in ignore_patterns):
+        if path.suffix.lower() not in valid_exts:
             continue
 
-        # Include only if it matches at least one include pattern (or no include pattern)
-        if include_patterns and not any(p.search(path_str) for p in include_patterns):
+        full_path_str = str(path.resolve())
+        if any(ignore_str in full_path_str for ignore_str in ignore_files_containing):
             continue
+
+        if resolve_path:
+            path = path.resolve()
 
         yield path
 
 
-def get_file_data(file_path: Path | str) -> tuple[int, int, int]:
-    """
-    Gets file stats safely across different Operating Systems.
-    Returns times in nanoseconds.
-    """
-    path = Path(file_path)
-    stat = path.stat()
-    mtime = stat.st_mtime_ns
-    try:
-        # macOS/BSD
-        ctime = getattr(stat, 'st_birthtime_ns', None)
-        if ctime is None:
-            # Windows (st_ctime is creation time on Windows)
-            ctime = stat.st_ctime_ns
-    except AttributeError:
-        # Linux fallback (st_ctime is metadata change, not birth)
-        ctime = mtime
+def build_files_cache(cache: dict, config: Config) -> dict:
+    cache_path = config.script.cache_file_path
+    save_cache_frequency = config.script.save_cache_frequency
 
-    size = stat.st_size
-    return mtime, ctime, size
+    media_dir = config.script.media_dir_path
+    ignore_files_containing = config.script.ignore_files_containing
 
+    image_exts = config.script.image_exts
+    video_exts = config.script.video_exts
+    valid_exts = image_exts | video_exts
 
-def generate_file_hash(file_path: str | Path, algorithm: str = "sha256") -> str:
-    file_path = Path(file_path)
-
-    with open(file_path, "rb") as f:
+    cache_updates = 0
+    for file_path in iter_media_files(media_dir, valid_exts, ignore_files_containing, resolve_path=True):
         try:
-            digest = hashlib.file_digest(f, algorithm)
-            return digest.hexdigest()
-        except AttributeError:
-            h = hashlib.new(algorithm)
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-            return h.hexdigest()
+            file_stats = file_path.stat()
+            size, mtime = file_stats.st_size, file_stats.st_mtime
+
+            if str(file_path.as_posix()) in cache["files"]:
+                cache_size = cache["files"][file_path.as_posix()]["size"]
+                cache_mtime = cache["files"][file_path.as_posix()]["mtime"]
+                if cache_size == size and cache_mtime == mtime:
+                    logger.debug("Skipping already cached unmodified file: %s", json.dumps(file_path.as_posix()))
+                    continue
+
+            file_hash = generate_fast_hash(file_path, image_exts=image_exts, video_exts=video_exts)
+            if file_hash:
+                cache["files"][file_path] = {
+                    "hash": file_hash,
+                    "size": size,
+                    "mtime": mtime,
+                }
+                logger.debug("Hashed: %s: %s", json.dumps(str(file_path.as_posix())), file_hash)
+                cache_updates += 1
+
+        except Exception as e:
+            logger.error("Failed to process %s: %s", json.dumps(str(file_path.as_posix())), e)
+            continue
+
+        if cache_updates == save_cache_frequency:
+            write_json_file(cache_path, cache)
+            cache_updates = 0
+    if cache_updates > 0:
+        write_json_file(cache_path, cache)
+        cache_updates = 0
+
+    return cache
 
 
-def generate_image_hash_no_metadata(file_path: str | Path, algorithm: str = "sha256") -> str:
-    file_path = Path(file_path)
-
-    with Image.open(file_path) as img:
-        # Re-save without metadata into RAM
-        buf = io.BytesIO()
-        img.save(buf, format=img.format)
-        buf.seek(0)
-
-        h = hashlib.new(algorithm)
-        for chunk in iter(lambda: buf.read(1024 * 1024), b""):
-            h.update(chunk)
-
-        return h.hexdigest()
-
-
-def generate_hash_ignore_metadata(file_path: Path, algorithm: str = "sha256",) -> str:
-    """
-    Generate a hash for a file, ignoring any metadata.
-    """
-    file_path = Path(file_path)
-    mime, _ = mimetypes.guess_type(str(file_path))
-
-    if mime and mime.startswith("image/"):
-        return generate_image_hash_no_metadata(file_path, algorithm)
-
-    # everything else: raw hash
-    return generate_file_hash(file_path, algorithm)
-
-
-def date_string_to_unix_nanos(date_str: str) -> int:
-    """
-    Cleans Unicode marks, parses the date, and returns a Unix timestamp in nanoseconds.
-    """
-    clean_str = re.sub(r'[^\x00-\x7f]', '', date_str).strip()
-    dt = datetime.strptime(clean_str, "%m/%d/%Y %I:%M %p")
-    timestamp_seconds = dt.timestamp()
-    return int(timestamp_seconds * 1_000_000_000)
-
-
-def build_files_cache(cache: dict, cache_file: Path, media_root: Path | str, media_extensions: list[str | Pattern], save_cache_every: int = 100) -> dict:
-    """
-    Scan media files and update the cache with metadata and hashes.
-
-    Features:
-        - Uses "find_files" with regex-based include filters
-        - Purges non-existent files before scanning
-        - Saves periodically every "checkpoint" changes
-        - Saves at the end if there are unsaved changes
-        - Handles hash/read errors gracefully
-
-    Args:
-        cache: The existing cache dictionary.
-        cache_file: Path to the cache file for saving.
-        media_root: Root directory to scan for media files.
-        media_extensions: List of regex strings or compiled patterns for files to include.
-        checkpoint: Number of changes before saving a partial cache.
-    """
-    logger.info("Building files cache... (This may take a while, please be patient)")
-
-    cache.setdefault("files", {})
+def build_hashes_cache(cache: dict, config: Config) -> dict:
     cache.setdefault("hashes", {})
 
-    changes_since_save = 0
-    total_changes = 0
-    time_since_last_processing_messsage = time.time()
-    files_scanned = 0
-
-    for file_path in find_files(media_root, recursive=True, include=media_extensions):
-        files_scanned += 1
-        full_file_path = Path(file_path).resolve()
-
-        try:
-            modified_time, created_time, size = get_file_data(full_file_path)
-            # properties = get_windows_details(full_file_path)
-            # date_taken = properties.get("Date taken", None)
-            # if date_taken is not None:
-            #     date_taken = date_string_to_unix_nanos(date_taken)
-        except Exception:
-            logger.exception(f"Failed to get file stats for {json.dumps(str(full_file_path.as_posix()))}. Skipping.")
-            continue
-
-        # Determine if we need to add/update the cache entry
-        old_entry = cache["files"].get(full_file_path.as_posix())
-        needs_update = (
-            old_entry is None or
-            # old_entry.get("date_taken") != date_taken or
-            old_entry.get("modified_time") != modified_time or
-            old_entry.get("created_time") != created_time or
-            old_entry.get("size") != size
-        )
-
-        if needs_update:
-            try:
-                file_hash = generate_hash_ignore_metadata(full_file_path)
-            except Exception:
-                logger.warning(f"Failed to generate hash for {json.dumps(str(full_file_path.as_posix()))}. Skipping.")
-                continue
-
-            cache["files"][full_file_path.as_posix()] = {
-                # "date_taken": date_taken,
-                "modified_time": modified_time,
-                "created_time": created_time,
-                "size": size,
-                "hash": file_hash
-            }
-
-            if old_entry is None:
-                logger.debug(f"Added {json.dumps(str(full_file_path.as_posix()))} to cache.")
-            else:
-                logger.debug(f"Updated {json.dumps(str(full_file_path.as_posix()))} in cache.")
-
-            changes_since_save += 1
-            total_changes += 1
-        # else:
-            # logger.debug(f"No changes detected for {json.dumps(str(full_file_path.as_posix()))}.")
-
-        # Checkpoint save every "checkpoint" changes
-        if changes_since_save >= save_cache_every:
-            save_cache(cache, cache_file)
-            changes_since_save = 0
-
-        # Log a progress message every second
-        if time.time() - time_since_last_processing_messsage >= 1:
-            logger.info(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
-            time_since_last_processing_messsage = time.time()
-        # if files_scanned % 5000 == 0:
-        #     logger.debug(f"Processed: {files_scanned:,} | Changes: {total_changes:,}")
-
-    # Final save for any remaining changes
-    if changes_since_save > 0:
-        save_cache(cache, cache_file)
-
-    logger.info(f"Finished building files cache. Scanned {files_scanned} files, made {total_changes} changes.")
-    return cache
-
-
-def build_hashes_cache(cache: dict, cache_file: Path) -> dict:
-    """
-    Build a hashes index: { hash: { path: data } }
-    Preserves original file discovery order without explicit sorting.
-    """
-    logger.debug("Building hashes cache...")
-    cache_file = Path(cache_file)
-
-    old_hashes = cache.get("hashes", {})
-    final_hashes = {}
-    total_changes = 0
-
-    # 1. Group files by their hash
     for file_path, file_data in cache.get("files", {}).items():
-        file_hash = file_data.get("hash")
-        if not file_hash:
-            continue
+        file_hash = file_data["hash"]
 
-        # Ensure the hash key exists, then add the file data to its sub-dictionary
-        if file_hash not in final_hashes:
-            final_hashes[file_hash] = {}
+        # Initialize the hash bucket if it doesn't exist
+        cache["hashes"].setdefault(file_hash, {})
 
-        final_hashes[file_hash][file_path] = file_data
+        # Assign the file data to the path key under that hash
+        cache["hashes"][file_hash][file_path] = {
+            "hash": file_hash,
+            "size": file_data["size"],
+            "mtime": file_data["mtime"]
+        }
+    cache_path = config.script.cache_file_path
+    write_json_file(cache_path, cache)
+    return cache
 
-    # 2. Check against old cache for reporting changes. We do this in a separate loop to ensure all hashes are fully built first
-    for file_hash, ordered_sub_dict in final_hashes.items():
-        old_val = old_hashes.get(file_hash)
-        if old_val is None or old_val != ordered_sub_dict:
-            total_changes += 1
 
-    cache["hashes"] = final_hashes
+def main():
+    config = Config()
+    cache_path = config.script.cache_file_path
 
-    if total_changes > 0:
-        logger.debug(f"Hashes cache updated. Made {total_changes} changes.")
+    cache = load_cache(cache_path)
+
+    cache = build_files_cache(cache=cache, config=config)
+    cache = build_hashes_cache(cache=cache, config=config)
+    pass
+
+
+def load_cache(file_path: Path) -> dict:
+    """
+    Returns an empty dict if the cache file does not exist, 
+    otherwise returns the parsed JSON content.
+    """
+    if not file_path.exists():
+        logger.debug("Cache file missing, initializing empty dict: %s", json.dumps(file_path.as_posix()))
+        data = {}
     else:
-        logger.debug("No changes detected in hashes cache.")
+        data = read_json_file(file_path) or {}
 
-    return cache
+    if not isinstance(data, dict):
+        raise TypeError("Cache is expected to be formatted as a dictionary.")
+
+    data.setdefault("files", {})
+
+    return data
 
 
-def purge_cache(cache: dict) -> dict:
+def read_json_file(file_path: Path) -> dict | list | None:
     """
-    Remove entries from the cache whose files no longer exist.
-
-    Args:
-        cache: The cache dictionary, expected to have a 'files' key.
-
-    Returns:
-        The cleaned cache dictionary.
+    Safely reads and parses a JSON file.
     """
-    logger.debug("Purging cache...")
-    if "files" in cache:
-        for file_path_str in list(cache["files"].keys()):
-            file_path = Path(file_path_str)
-            if not file_path.exists():
-                cache["files"].pop(file_path_str, None)
-                logger.debug(f"Removed non-existing file from cache: {json.dumps(str(file_path.as_posix()))}")
-    return cache
-
-
-def send_to_recycle_bin(path: Path) -> bool:
-    """
-    Sends any duplicate files to the recycle bin
-
-    Args:
-        duplicates: A list of duplicate files
-    """
-    path = Path(path)
+    if not file_path.exists():
+        logger.warning("File not found: %s", json.dumps(str(file_path)))
+        raise FileNotFoundError("File not found")
 
     try:
-        send2trash.send2trash(str(path))
-        logger.info(f"Sent {json.dumps(str(path.as_posix()))} to recycle bin.")
-        return True
-    except OSError:
-        logger.exception(f"Failed to send {json.dumps(str(path.as_posix()))} to recycle bin.")
+        data = json.loads(file_path.read_text(encoding='utf-8'))
+        logger.info("Successfully read data from %s", json.dumps(str(file_path)))
+        return data
+
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON format in %s: %s", json.dumps(str(file_path)), e)
+        raise
+
+    except Exception as e:
+        logger.error("Unexpected error reading %s: %s", json.dumps(str(file_path)), e)
         raise
 
 
-def remove_duplicates(cache: dict) -> None:
+def write_json_file(file_path: Path, data: dict | list) -> bool:
     """
-    Sends any duplicate files to the recycle bin and removes them from the cache
+    Writes data to a JSON file atomically, converting Path keys and values to strings.
     """
-    deleted_files = 0
-    for hash_val, data in cache.get("hashes_by_priority", {}).items():
-        files_to_delete = data.get("lower", [])
-        for file_to_delete in files_to_delete:
-            logger.debug(f"file_to_delete = {json.dumps(str(file_to_delete))}")
-            try:
-                send_to_recycle_bin(file_to_delete)
-                deleted_files += 1
-            except:
-                pass
-    logger.info(f"Removed {deleted_files} duplicate files.")
+    file_path = file_path.absolute()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-
-def build_folders_cache(cache: dict, cache_file: Path) -> dict:
-    """
-    Build a folders index: { folder: { path: data } }
-    Sorted by: Created (oldest), Modified (oldest), Size (largest).
-    """
-    logger.debug("Building folders cache... (This may take a while, please be patient)")
-    cache_file = Path(cache_file)
-
-    total = 0
-    cache.setdefault("folders", [])
-    for file_path in cache.get("files", {}).keys():
-        file_path = Path(file_path)
-        file_dir = file_path.parent
-        if file_dir not in cache["folders"]:
-            cache["folders"].append(file_dir)
-            total += 1
-    # cache["folders"].sort(key=lambda f: f.lower())
-    logger.debug(f"Built folders cache. Found {total} folders.")
-    return cache
-
-
-def sanitize_paths(data):
-    """
-    Recursively converts pathlib.Path objects to posix strings.
-    Handles dictionaries and lists.
-    """
-    if isinstance(data, dict):
-        return {k: sanitize_paths(v) for k, v in data.items()}
-    if isinstance(data, list):
-        return [sanitize_paths(i) for i in data]
-    if isinstance(data, Path):
-        return data.as_posix()
-    return data
-
-
-def build_hashes_by_priority_cache(cache: dict, duplicates_keep_folder_priority) -> dict:
-    logger.debug("Building hashes_by_priority cache... (This may take a while, please be patient)")
-    cache["hashes_by_priority"] = {}
-    for hash_val, files in cache["hashes"].items():
-        if len(files.keys()) > 1:
-            files = list(Path(f) for f in files)
-            file_to_keep = None
-            for priority_folder in duplicates_keep_folder_priority:
-                priority_path = Path(priority_folder)
-                # Check if any file in the current hash group lives in this folder
-                file_to_keep = next((f for f in files if f.parent == priority_path), None)
-                if file_to_keep:
-                    break
-            if not file_to_keep:
-                file_to_keep = files[0]
-            files_to_remove = [f for f in files if f != file_to_keep]
-
-            cache["hashes_by_priority"][hash_val] = {
-                "highest": file_to_keep,
-                "lower": files_to_remove
+    def sanitize_data(obj):
+        if isinstance(obj, Path):
+            return obj.as_posix()
+        if isinstance(obj, dict):
+            return {
+                (k.as_posix() if isinstance(k, Path) else k): sanitize_data(v)
+                for k, v in obj.items()
             }
-    return cache
+        if isinstance(obj, list):
+            return [sanitize_data(i) for i in obj]
+        return obj
+
+    temp_file_path: Path | None = None
+    try:
+        clean_data = sanitize_data(data)
+
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            dir=str(file_path.parent),
+            encoding='utf-8',
+            suffix=".tmp",
+            delete=False
+        ) as tf:
+            temp_file_path = Path(tf.name)
+            json.dump(clean_data, tf, indent=4)
+            tf.flush()
+            os.fsync(tf.fileno())
+
+        temp_file_path.replace(file_path)
+        logger.info("Successfully saved to %s", json.dumps(str(file_path.as_posix())))
+        return True
+
+    except (KeyboardInterrupt, SystemExit):
+        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path.as_posix())))
+        if temp_file_path and temp_file_path.exists():
+            temp_file_path.unlink()
+        raise
+
+    except Exception as e:
+        logger.error("Failed to write to %s: %s", json.dumps(str(file_path.as_posix())), e)
+        if temp_file_path and temp_file_path.exists():
+            temp_file_path.unlink()
+        return False
 
 
-def main(config) -> None:
-    # logger.debug(f"Config: {json.dumps(config, indent=4)}")
+def load_config(file_path: Path) -> Config:
+    config = Config()
+    needs_sync = False
 
-    cache_file_path = config.get("cache_file", None)
-    if cache_file_path is None:
-        logger.error("No cache file specified in config.")
-        raise ValueError
-    cache_file_path = Path(str(cache_file_path))
-    # logger.debug(f"Cache file: {json.dumps(str(cache_file))}")
+    try:
+        external_config = read_json_file(file_path)
+        if not isinstance(external_config, dict):
+            external_config = {}
+            needs_sync = True
+    except FileNotFoundError:
+        external_config = {}
+        needs_sync = True
+    except Exception:
+        raise
 
-    media_root_path = config.get("media_dir", None)
-    if media_root_path is None:
-        logger.error("No media root specified in config.")
-        raise ValueError
-    media_root_path = Path(str(media_root_path))
-    # logger.debug(f"Media root: {json.dumps(str(media_root))}")
+    # Merge logic
+    for section in fields(config):
+        section_name = section.name
+        if section_name not in external_config:
+            needs_sync = True
+            continue
 
-    media_extensions = config.get("media_extensions", None)
-    if media_extensions is None:
-        logger.error("No media extensions specified in config.")
-        raise ValueError
-    media_extensions = list(media_extensions)
-    # logger.debug(f"Media extensions: {json.dumps(media_extensions)}")
+        section_instance = getattr(config, section_name)
+        json_values = external_config[section_name]
 
-    duplicates_keep_folder_priority = config.get("duplicates_keep_folder_priority", None)
-    if duplicates_keep_folder_priority is not None:
-        try:
-            duplicates_keep_folder_priority = list(duplicates_keep_folder_priority)
-            duplicates_keep_folder_priority = [Path(p) for p in duplicates_keep_folder_priority]
-        except TypeError:
-            logger.error("duplicates_keep_folder_priority must be a list of file paths in config.")
-            raise
-    else:
-        logger.error("duplicates_keep_folder_priority is missing from config.")
+        for f in fields(section_instance):
+            if f.name in json_values:
+                val = json_values[f.name]
+                if f.type is Path and isinstance(val, str):
+                    val = Path(val)
+                setattr(section_instance, f.name, val)
+            else:
+                needs_sync = True
 
-    cache = load_cache(cache_file_path)
-    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+    # Check for keys in external config that aren't in internal config
+    internal_field_names = {f.name for f in fields(config)}
+    if any(k for k in external_config if k not in internal_field_names):
+        needs_sync = True
 
-    cache = purge_cache(cache)
-    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+    if needs_sync:
+        def path_serializer(obj):
+            if isinstance(obj, Path):
+                return str(obj)
+            raise TypeError(f"Type {type(obj)} not serializable")
 
-    cache = build_files_cache(cache, cache_file_path, media_root_path, media_extensions)
-    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
+        # We re-serialize the internal_config (which now has merged data)
+        # This naturally prunes extra keys because they weren't in the dataclass!
+        synced_config = json.loads(json.dumps(asdict(config), default=path_serializer))
+        write_json_file(file_path, synced_config)
 
-    cache = build_hashes_cache(cache, cache_file_path)
-    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
-
-    cache = build_folders_cache(cache, cache_file_path)
-    # logger.debug(f"Cache: {json.dumps(cache, indent=4)}")
-
-    missing_folders_from_config = [folder for folder in cache["folders"] if folder not in duplicates_keep_folder_priority]
-    if len(missing_folders_from_config) > 0:
-        str_missing_folders_from_config = [str(p) for p in missing_folders_from_config]
-        logger.warning(f"Missing folders from config: {json.dumps(str_missing_folders_from_config, indent=4)}")
-        raise ValueError("Missing folders from config in duplicates_keep_folder_priority. They must be added to properly remove duplicates.")
-
-    cache = build_hashes_by_priority_cache(cache, duplicates_keep_folder_priority)
-    # logger.debug(f"Cache: {json.dumps(sanitize_paths(cache), indent=4)}")
-
-    remove_duplicates(cache)
+    return config
 
 
-def format_duration_long(duration_seconds: float) -> str:
+def save_config(file_path: Path, config_data: dict | list) -> bool:
+    """Alias for write_json_file, specifically for configuration files."""
+    return write_json_file(file_path, config_data)
+
+
+def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
     """
-    Format duration in a human-friendly way, showing only the two largest non-zero units.
-    For durations >= 1s, do not show microseconds or nanoseconds.
-    For durations >= 1m, do not show milliseconds.
+    Enforce a maximum number of log files for this script.
+    Deletes the oldest logs based on filename ordering.
+
+    Rules:
+    - Only affects files ending with `.log`
+    - Only affects logs that contain the script_name
+    - Sorting is done by filename (lexicographically)
     """
-    ns = int(duration_seconds * 1_000_000_000)
-    units = [
-        ("y", 365 * 24 * 60 * 60 * 1_000_000_000),
-        ("mo", 30 * 24 * 60 * 60 * 1_000_000_000),
-        ("d", 24 * 60 * 60 * 1_000_000_000),
-        ("h", 60 * 60 * 1_000_000_000),
-        ("m", 60 * 1_000_000_000),
-        ("s", 1_000_000_000),
-        ("ms", 1_000_000),
-        ("us", 1_000),
-        ("ns", 1),
-    ]
-    parts = []
-    for name, factor in units:
-        value, ns = divmod(ns, factor)
-        if value:
-            parts.append(f"{value}{name}")
-        if len(parts) == 2:
-            break
-    if not parts:
-        return "0s"
-    return "".join(parts)
-
-
-def enforce_max_log_count(dir_path: Path | str, max_count: int | None, script_name: str) -> None:
-    """Keep only the N most recent logs for this script."""
-    if max_count is None or max_count <= 0:
+    if max_count <= 0:
         return
+    if not dir_path.exists():
+        return
+    log_files = [
+        f for f in dir_path.glob("*.log")
+        if script_name in f.name
+    ]
+    if len(log_files) <= max_count:
+        return
+    log_files.sort(key=lambda p: p.name)
+    to_delete = log_files[:-max_count]
+    for file in to_delete:
+        try:
+            file.unlink()
+            logger.debug("Removed %s", json.dumps(file.absolute().as_posix()))
+        except Exception:
+            # Avoid raising during bootstrap
+            pass
 
-    dir_path = Path(dir_path)
 
-    # Get all logs for this script, sorted by name (which is our timestamp)
-    # Newest will be at the end of the list
-    files = sorted([f for f in dir_path.glob(f"*{script_name}*.log") if f.is_file()])
+def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path | None:
+    """Set up file and console logging with flexible modes and rotation."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    day_stamp = datetime.now().strftime("%Y%m%d")
+    script_name = Path(__file__).stem
+    pc_name = socket.gethostname()
 
-    # If we have more than the limit, calculate how many to delete
-    if len(files) > max_count:
-        to_delete = files[:-max_count]  # Everything except the last N files
-        for f in to_delete:
-            try:
-                f.unlink()
-                logger.debug(f"Deleted old log: {f.name}")
-            except OSError as e:
-                logger.error(f"Failed to delete {f.name}: {e}")
+    log_path: Path | None = None
 
+    if log_settings.mode != "ConsoleOnly":
+        log_dir = (log_settings.folder if isinstance(log_settings.folder, Path) else Path(log_settings.folder))
+        log_dir = log_dir.expanduser().resolve()
+        if not log_dir.exists():
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logger.debug("Created log folder: %s", log_dir.as_posix())
 
-def setup_logging(
-        logger_obj: logging.Logger,
-        file_path: Path | str,
-        script_name: str,
-        max_log_files: int | None = None,
-        console_logging_level: int = logging.DEBUG,
-        file_logging_level: int = logging.DEBUG,
-        message_format: str = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s]: %(message)s",
-        date_format: str = "%Y-%m-%d %H:%M:%S"
-) -> None:
-    """
-    Set up logging for a script safely.
-
-    Immediate flush for Tkinter callbacks is handled automatically.
-    """
-    file_path = Path(file_path)
-    dir_path = file_path.parent
-    dir_path.mkdir(parents=True, exist_ok=True)
+        match log_settings.mode:
+            case "per_run":
+                log_path = log_dir / f"{timestamp}__{script_name}__{pc_name}.log"
+            case "latest":
+                log_path = log_dir / f"latest_{script_name}__{pc_name}.log"
+            case "per_day":
+                log_path = log_dir / f"{day_stamp}__{script_name}__{pc_name}.log"
+            case "single_file":
+                log_path = log_dir / f"{script_name}__{pc_name}.log"
+            case _:
+                log_path = log_dir / f"{timestamp}__{script_name}__{pc_name}.log"
 
     logger_obj.handlers.clear()
-    logger_obj.setLevel(min(console_logging_level, file_logging_level))
+    logger_obj.setLevel(logging.DEBUG)
 
-    formatter = logging.Formatter(message_format, datefmt=date_format)
+    # Formatter
+    formatter = logging.Formatter(
+        log_settings.message_format,
+        datefmt=log_settings.date_format,
+    )
 
-    # File Handler
-    file_handler = logging.FileHandler(file_path, encoding="utf-8")
-    file_handler.setLevel(file_logging_level)
-    file_handler.setFormatter(formatter)
-    logger_obj.addHandler(file_handler)
+    # File handler
+    file_handler: logging.Handler | None = None
+    if log_path:
+        match log_settings.mode:
+            case "per_day":
+                file_handler = TimedRotatingFileHandler(
+                    filename=log_path,
+                    when="midnight",
+                    interval=1,
+                    backupCount=log_settings.max_files or 0,
+                    encoding="utf-8",
+                )
+            case "single_file" | "latest" | "per_run":
+                file_mode = "a" if log_settings.mode == "single_file" else "w"
+                file_handler = logging.FileHandler(
+                    log_path,
+                    mode=file_mode,
+                    encoding="utf-8",
+                )
+    if file_handler:
+        file_handler.setLevel(log_settings.file_level)
+        file_handler.setFormatter(formatter)
+        logger_obj.addHandler(file_handler)
 
-    # Console Handler
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(console_logging_level)
+    console_handler.setLevel(log_settings.console_level)
     console_handler.setFormatter(formatter)
     logger_obj.addHandler(console_handler)
 
-    if max_log_files is not None:
-        enforce_max_log_count(dir_path, max_log_files, script_name)
+    # Flush logs buffer from prior to logging initialization
+    if "log_buffer" in globals():
+        class _ForwardToLogger(logging.Handler):
+            def emit(self, record):
+                logger_obj.handle(record)
 
+        forward_handler = _ForwardToLogger()
+        log_buffer.setTarget(forward_handler)
+        log_buffer.flush()
+        log_buffer.close()
 
-def load_config(file_path: Path | str) -> dict:
-    """
-    Load configuration from a TOML file.
+    # Enforce max log count (except per_day which rotates automatically)
+    if log_settings.max_files and log_path and log_settings.mode not in ("per_day", "ConsoleOnly"):
+        try:
+            enforce_max_log_count(
+                dir_path=log_path.parent,
+                max_count=log_settings.max_files,
+                script_name=script_name,
+            )
+        except Exception as e:
+            logger_obj.debug("Log pruning skipped: %s", e)
 
-    Args:
-    file_path (Path | str): The file path of the TOML file to read.
-
-    Returns:
-    dict: The contents of the TOML file as a dictionary.
-    """
-    file_path = Path(file_path)
-    if not file_path.exists():
-        raise FileNotFoundError(f"File not found: {json.dumps(str(file_path))}")
-    data = read_toml(file_path)
-    return data
+    return log_path
 
 
 def bootstrap():
-    """
-    Handles environment setup, configuration loading,
-    and logging before executing the main script logic.
-    """
     exit_code = 0
-    try:
-        # Resolve paths and configuration
-        script_path = Path(__file__)
-        script_name = script_path.stem
-        config_path = script_path.with_name(f"{script_name}_config.toml")
+    log_path = None
+    script_path = Path(__file__)
 
-        # Load settings
+    logger.info("=" * 80)
+
+    config = Config()
+    config_path = script_path.with_name(f"{script_path.stem}_config.json")
+    global_settings = InternalSettings()
+    if global_settings.use_config_file:
         config = load_config(config_path)
-        logger_config = config.get("logging", {})
 
-        # Parse log levels and formats
-        console_log_level = getattr(logging, logger_config.get("console_logging_level", "INFO").upper(), logging.INFO)
-        file_log_level = getattr(logging, logger_config.get("file_logging_level", "INFO").upper(), logging.INFO)
-        log_message_format = logger_config.get("log_message_format", "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s")
+    try:
+        log_path = setup_logging(logger_obj=logger, log_settings=config.logs)
+        logger.info("%-10s %s", "Version:", __version__)
+        logger.info("%-10s %s on %s", "User/Host:", os.getlogin(), socket.gethostname())
+        logger.info("%-10s %s %s (v%s)", "Platform:", platform.system(), platform.release(), platform.version())
+        logger.info("%-10s Python %s", "Runtime:", sys.version.split()[0])
+        logger.info("%-10s %s", "Directory:", Path.cwd().as_posix())
+        logger.info("%-10s %s", "AppConfig:", config)
 
-        # Setup directories and filenames
-        logs_folder = Path(logger_config.get("logs_folder_name", "logs"))
-        logs_folder.mkdir(parents=True, exist_ok=True)
-
-        pc_name = socket.gethostname()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = logs_folder / f"{timestamp}__{script_name}__{pc_name}.log"
-
-        # Initialize logging
-        setup_logging(
-            logger_obj=logger,
-            file_path=log_path,
-            script_name=script_name,
-            max_log_files=logger_config.get("max_log_files"),
-            console_logging_level=console_log_level,
-            file_logging_level=file_log_level,
-            message_format=log_message_format
-        )
-
-        exit_behavior_config = config.get("exit_behavior", {})
-        pause_before_exit = exit_behavior_config.get("always_pause", False)
-        pause_before_exit_on_error = exit_behavior_config.get("pause_on_error", True)
-
-        start_ns = time.perf_counter_ns()
-        logger.info(f"Script: {json.dumps(script_name)} | Version: {__version__} | Host: {json.dumps(pc_name)}")
-
-        main(config)
-
-        end_ns = time.perf_counter_ns()
-        duration_str = format_duration_long((end_ns - start_ns) / 1e9)
-        logger.info(f"Execution completed in {duration_str}.")
+        main()
 
     except KeyboardInterrupt:
         logger.warning("Operation interrupted by user.")
         exit_code = 130
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        # Using 'err' or 'exc' is standard; logging the traceback handles the 'broad-except'
-        logger.error(f"A fatal error has occurred: {e}")
+    except Exception as e:
+        logger.exception("A fatal error has occurred: %s", e)
         exit_code = 1
     finally:
         for handler in logger.handlers[:]:
             handler.close()
             logger.removeHandler(handler)
 
-    if pause_before_exit or (pause_before_exit_on_error and exit_code != 0):
+    if config.logs.open_log_after_run and log_path and log_path.exists():
+        try:
+            match sys.platform:
+                case plat if plat.startswith("win"):  # Windows
+                    os.startfile(log_path)
+                case "darwin":  # macOS
+                    os.system(f'open "{log_path}"')
+                case _:  # Linux / others
+                    os.system(f'xdg-open "{log_path}"')
+        except Exception as e:
+            logger.warning("Failed to open log file: %s", e)
+
+    if config.runtime.always_pause or (config.runtime.pause_on_error and exit_code != 0):
         input("Press Enter to exit...")
 
     return exit_code
