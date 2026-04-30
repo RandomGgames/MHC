@@ -230,7 +230,6 @@ def main():
 
     cache = build_files_cache(cache=cache, config=config)
     cache = build_hashes_cache(cache=cache, config=config)
-    pass
 
 
 def load_cache(file_path: Path) -> dict:
