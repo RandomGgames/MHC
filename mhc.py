@@ -1,8 +1,5 @@
 """
-MHC: Media Hasher and Cacher
-
-A python script which hashes images and videos, then based
-on a keep priority, deletes duplicates.
+{Script Name}
 
 {Summary of what the script does}
 
@@ -10,37 +7,25 @@ on a keep priority, deletes duplicates.
 """
 
 import cv2
-import hashlib
 import imagehash
-import io
 import json
 import logging
 import logging.handlers
-import mimetypes
-import numpy as np
 import os
 import platform
-import re
-import send2trash
 import socket
 import sys
 import tempfile
-import time
-import tomllib
 import typing
-import win32com.client
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from PIL import Image
-from pillow_heif import register_heif_opener
-from typing import Iterable, Pattern
 
 logger = logging.getLogger(__name__)
 
-__version__ = "2.0.0"  # Major.Minor.Patch
-
+__version__ = "1.2.0"  # Major.Minor.Patch
 
 logger = logging.getLogger(__name__)
 log_buffer = logging.handlers.MemoryHandler(
@@ -51,28 +36,17 @@ log_buffer = logging.handlers.MemoryHandler(
 logger.addHandler(log_buffer)
 logger.setLevel(logging.DEBUG)
 
-register_heif_opener()
+cache = {}
 
 
 @dataclass
 class ScriptSettings:
-    IMAGE_EXTENSIONS = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".bmp",
-        ".webp",
-        ".tiff",
-        ".heic",
-        ".heif"
-    }
-    VIDEO_EXTENSIONS = {
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".mkv",
-        ".webm"
-    }
+    media_dir_path = Path(r"H:\Media Backup")
+    cache_file_path = Path(r"cache.json")
+    save_cache_frequency = 100  # files scanned
+    ignore_files_containing = ["$", "System"]
+    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+    video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
 
 
 @dataclass
@@ -105,79 +79,177 @@ class Config:
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
 
 
-def hash_image_file(path, hash_size=16):
-    """
-    Compute a perceptual hash for a single image file.
-    Supports HEIC and standard image formats.
+class HashGenerationError(Exception):
+    """Custom exception for media hashing failures."""
+    pass
 
-    Returns:
-        np.ndarray: binary hash array or None if failed
-    """
-    ext = os.path.splitext(path)[1].lower()
+
+def generate_fast_hash(file_path: Path, image_exts: set, video_exts: set):
+    ext = file_path.suffix.lower()
+
+    if ext in image_exts:
+        return get_fast_image_hash(file_path)
+    if ext in video_exts:
+        return get_fast_video_hash(file_path)
+
+    raise HashGenerationError(f"Unsupported file extension: {ext}")
+
+
+def get_fast_image_hash(file_path: Path):
+    try:
+        with Image.open(file_path) as img:
+            img = img.convert("L").resize((32, 32), Image.Resampling.NEAREST)
+            return str(imagehash.phash(img))
+    except Exception as e:
+        logger.error("Image hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
+        raise
+
+
+def get_fast_video_hash(file_path: Path):
+    cap = cv2.VideoCapture(str(file_path.resolve()))
+
+    if not cap.isOpened():
+        logger.error("OpenCV could not open %s", json.dumps(str(file_path.as_posix())))
+        raise HashGenerationError("OpenCV open failure")
 
     try:
-        img = Image.open(path).convert("L")
-        h = imagehash.phash(img, hash_size=hash_size)
-        return np.array(h.hash).astype(np.uint8)
+        success, frame = cap.read()
+        if not success or frame is None:
+            logger.error("Could not read frame from %s", json.dumps(str(file_path.as_posix())))
+            raise HashGenerationError("Frame read failure")
+
+        small_frame = cv2.resize(frame, (32, 32), interpolation=cv2.INTER_NEAREST)
+        gray_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+        img = Image.fromarray(gray_frame)
+        return str(imagehash.phash(img))
     except Exception as e:
-        print(f"Error hashing image {path}: {e}")
-        return None
-
-
-def hash_video_file(path, hash_size=16, num_frames=8):
-    """
-    Compute a perceptual hash for a video file by sampling frames.
-
-    Returns:
-        np.ndarray: median hash array or None if failed
-    """
-    ext = os.path.splitext(path)[1].lower()
-
-    cap = cv2.VideoCapture(path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0:
+        logger.error("Video hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
+        raise
+    finally:
         cap.release()
-        return None
 
-    frame_idxs = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-    hashes = []
 
-    for idx in frame_idxs:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
+def iter_media_files(media_dir: Path, valid_exts: set, ignore_files_containing: list, resolve_path: bool = False):
+    """
+    Scans media_dir recursively and yields valid Path objects.
+
+    - valid_exts: A set of lowercase extensions like {'.jpg', '.mp4'}
+    - ignore_list: A list of strings to check against the full file path.
+    """
+    # rglob('*') finds everything recursively
+    for path in media_dir.rglob("*"):
+        if not path.is_file():
             continue
 
-        # Convert to PIL image
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame).convert("L")
-        h = imagehash.phash(pil_img, hash_size=hash_size)
-        hashes.append(np.array(h.hash).astype(np.uint8))
+        if path.suffix.lower() not in valid_exts:
+            continue
 
-    cap.release()
-    if not hashes:
-        return None
+        full_path_str = str(path.resolve())
+        if any(ignore_str in full_path_str for ignore_str in ignore_files_containing):
+            continue
 
-    # Median aggregation across frames
-    return np.median(hashes, axis=0).astype(np.uint8)
+        if resolve_path:
+            path = path.resolve()
 
-
-def hash_distance(h1, h2):
-    """
-    Compute Hamming distance between two hashes (images or videos)
-    """
-    return np.sum(h1 != h2)
+        yield path
 
 
-def is_similar(h1, h2, threshold=4):
-    """
-    Check if two hashes are similar based on a threshold.
-    """
-    return hash_distance(h1, h2) <= threshold
+def build_files_cache(cache: dict, config: Config) -> dict:
+    cache_path = config.script.cache_file_path
+    save_cache_frequency = config.script.save_cache_frequency
+
+    media_dir = config.script.media_dir_path
+    ignore_files_containing = config.script.ignore_files_containing
+
+    image_exts = config.script.image_exts
+    video_exts = config.script.video_exts
+    valid_exts = image_exts | video_exts
+
+    cache_updates = 0
+    for file_path in iter_media_files(media_dir, valid_exts, ignore_files_containing, resolve_path=True):
+        try:
+            file_stats = file_path.stat()
+            size, mtime = file_stats.st_size, file_stats.st_mtime
+
+            if str(file_path.as_posix()) in cache["files"]:
+                cache_size = cache["files"][file_path.as_posix()]["size"]
+                cache_mtime = cache["files"][file_path.as_posix()]["mtime"]
+                if cache_size == size and cache_mtime == mtime:
+                    logger.debug("Skipping already cached unmodified file: %s", json.dumps(file_path.as_posix()))
+                    continue
+
+            file_hash = generate_fast_hash(file_path, image_exts=image_exts, video_exts=video_exts)
+            if file_hash:
+                cache["files"][file_path] = {
+                    "hash": file_hash,
+                    "size": size,
+                    "mtime": mtime,
+                }
+                logger.debug("Hashed: %s: %s", json.dumps(str(file_path.as_posix())), file_hash)
+                cache_updates += 1
+
+        except Exception as e:
+            logger.error("Failed to process %s: %s", json.dumps(str(file_path.as_posix())), e)
+            continue
+
+        if cache_updates == save_cache_frequency:
+            write_json_file(cache_path, cache)
+            cache_updates = 0
+    if cache_updates > 0:
+        write_json_file(cache_path, cache)
+        cache_updates = 0
+
+    return cache
+
+
+def build_hashes_cache(cache: dict, config: Config) -> dict:
+    cache.setdefault("hashes", {})
+
+    for file_path, file_data in cache.get("files", {}).items():
+        file_hash = file_data["hash"]
+
+        # Initialize the hash bucket if it doesn't exist
+        cache["hashes"].setdefault(file_hash, {})
+
+        # Assign the file data to the path key under that hash
+        cache["hashes"][file_hash][file_path] = {
+            "hash": file_hash,
+            "size": file_data["size"],
+            "mtime": file_data["mtime"]
+        }
+    cache_path = config.script.cache_file_path
+    write_json_file(cache_path, cache)
+    return cache
 
 
 def main():
-    """Code goes here"""
+    config = Config()
+    cache_path = config.script.cache_file_path
+
+    cache = load_cache(cache_path)
+
+    cache = build_files_cache(cache=cache, config=config)
+    cache = build_hashes_cache(cache=cache, config=config)
+    pass
+
+
+def load_cache(file_path: Path) -> dict:
+    """
+    Returns an empty dict if the cache file does not exist, 
+    otherwise returns the parsed JSON content.
+    """
+    if not file_path.exists():
+        logger.debug("Cache file missing, initializing empty dict: %s", json.dumps(file_path.as_posix()))
+        data = {}
+    else:
+        data = read_json_file(file_path) or {}
+
+    if not isinstance(data, dict):
+        raise TypeError("Cache is expected to be formatted as a dictionary.")
+
+    data.setdefault("files", {})
+
+    return data
 
 
 def read_json_file(file_path: Path) -> dict | list | None:
@@ -195,45 +267,60 @@ def read_json_file(file_path: Path) -> dict | list | None:
 
     except json.JSONDecodeError as e:
         logger.error("Invalid JSON format in %s: %s", json.dumps(str(file_path)), e)
-        return None
+        raise
 
     except Exception as e:
         logger.error("Unexpected error reading %s: %s", json.dumps(str(file_path)), e)
-        return None
+        raise
 
 
 def write_json_file(file_path: Path, data: dict | list) -> bool:
     """
-    Writes data to a JSON file atomically.
+    Writes data to a JSON file atomically, converting Path keys and values to strings.
     """
-    file_path = Path(file_path).absolute()
+    file_path = file_path.absolute()
+    file_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not file_path.parent.exists():
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.debug("Created %s", json.dumps(str(file_path.parent.as_posix())))
+    def sanitize_data(obj):
+        if isinstance(obj, Path):
+            return obj.as_posix()
+        if isinstance(obj, dict):
+            return {
+                (k.as_posix() if isinstance(k, Path) else k): sanitize_data(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [sanitize_data(i) for i in obj]
+        return obj
 
     temp_file_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(mode='w', dir=str(file_path.parent), encoding='utf-8', suffix=".tmp", delete=False) as tf:
-            # Get file path from tempfile object
+        clean_data = sanitize_data(data)
+
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            dir=str(file_path.parent),
+            encoding='utf-8',
+            suffix=".tmp",
+            delete=False
+        ) as tf:
             temp_file_path = Path(tf.name)
-            json.dump(data, tf, indent=4)
+            json.dump(clean_data, tf, indent=4)
             tf.flush()
             os.fsync(tf.fileno())
 
-        # Atomic swap
         temp_file_path.replace(file_path)
-        logger.info("Successfully saved to %s", json.dumps(str(file_path)))
+        logger.info("Successfully saved to %s", json.dumps(str(file_path.as_posix())))
         return True
 
     except (KeyboardInterrupt, SystemExit):
-        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path)))
+        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path.as_posix())))
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         raise
 
     except Exception as e:
-        logger.error("Failed to write to %s: %s", json.dumps(str(file_path)), e)
+        logger.error("Failed to write to %s: %s", json.dumps(str(file_path.as_posix())), e)
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         return False
@@ -290,6 +377,11 @@ def load_config(file_path: Path) -> Config:
         write_json_file(file_path, synced_config)
 
     return config
+
+
+def save_config(file_path: Path, config_data: dict | list) -> bool:
+    """Alias for write_json_file, specifically for configuration files."""
+    return write_json_file(file_path, config_data)
 
 
 def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
