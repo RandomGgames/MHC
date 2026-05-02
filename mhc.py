@@ -41,19 +41,29 @@ logger.setLevel(logging.DEBUG)
 cache = {}
 
 
+class FilterMode:
+    OLDEST = "by_oldest"
+    NEWEST = "by_newest"
+    FOLDER_PRIORITY = "by_folder_priority"
+    NONE = None  # Scanned order
+
+
 @dataclass
 class ScriptSettings:
     media_dir_path = Path(r"H:\Media Backup")
-    cache_file_path = Path(r"cache.json")
+    filter_mode = FilterMode.FOLDER_PRIORITY
+    folder_priority = [
+        Path(r"")
+    ]
+    remove_deleted_files_from_cache = True
     save_cache_frequency = 100  # files scanned
+    cache_file_path = Path(r"cache.json")
     ignore_files_containing = ["$", "System"]
-    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
-    video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
 
 
 @dataclass
 class LogSettings:
-    mode: typing.Literal["per_run", "latest", "per_day", "single_file", "ConsoleOnly"] = "per_day"
+    mode: typing.Literal["per_run", "latest", "per_day", "single_file", "ConsoleOnly"] = "latest"
     folder: Path = Path(r"Logs")
     console_level: int = logging.DEBUG
     file_level: int = logging.DEBUG
@@ -157,49 +167,62 @@ def iter_media_files(media_dir: Path, valid_exts: set, ignore_files_containing: 
 
 
 def build_files_cache(cache: dict, config: Config) -> dict:
+    logger.debug("Building files cache...")
     cache_path = config.script.cache_file_path
     save_cache_frequency = config.script.save_cache_frequency
+    remove_deleted = config.script.remove_deleted_files_from_cache
 
     media_dir = config.script.media_dir_path
     ignore_files_containing = config.script.ignore_files_containing
 
-    image_exts = config.script.image_exts
-    video_exts = config.script.video_exts
+    image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
+    video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
     valid_exts = image_exts | video_exts
 
     cache_updates = 0
+
+    seen_paths = set()
     for file_path in iter_media_files(media_dir, valid_exts, ignore_files_containing, resolve_path=True):
         try:
+            path_str = str(file_path.as_posix())
+            seen_paths.add(path_str)  # Mark this file as "alive"
+
             file_stats = file_path.stat()
             size, mtime = file_stats.st_size, file_stats.st_mtime
 
-            if str(file_path.as_posix()) in cache["files"]:
-                cache_size = cache["files"][file_path.as_posix()]["size"]
-                cache_mtime = cache["files"][file_path.as_posix()]["mtime"]
-                if cache_size == size and cache_mtime == mtime:
-                    logger.debug("Skipping already cached unmodified file: %s", json.dumps(file_path.as_posix()))
+            if path_str in cache["files"]:
+                entry = cache["files"][path_str]
+                if entry["size"] == size and entry["mtime"] == mtime:
                     continue
 
             file_hash = generate_fast_hash(file_path, image_exts=image_exts, video_exts=video_exts)
             if file_hash:
-                cache["files"][file_path] = {
+                cache["files"][path_str] = {
                     "hash": file_hash,
                     "size": size,
                     "mtime": mtime,
                 }
-                logger.debug("Hashed: %s: %s", json.dumps(str(file_path.as_posix())), file_hash)
+                logger.debug("Hashed: %s: %s", json.dumps(path_str), file_hash)
                 cache_updates += 1
 
         except Exception as e:
             logger.error("Failed to process %s: %s", json.dumps(str(file_path.as_posix())), e)
             continue
 
-        if cache_updates == save_cache_frequency:
+        if cache_updates >= save_cache_frequency:
             write_json_file(cache_path, cache)
             cache_updates = 0
+
+    if remove_deleted:
+        cached_paths = list(cache["files"].keys())
+        for path in cached_paths:
+            if path not in seen_paths:
+                logger.debug("Removing stale entry from cache: %s", json.dumps(str(path)))
+                del cache["files"][path]
+                cache_updates += 1
+
     if cache_updates > 0:
         write_json_file(cache_path, cache)
-        cache_updates = 0
 
     return cache
 
@@ -224,6 +247,47 @@ def build_hashes_cache(cache: dict, config: Config) -> dict:
     return cache
 
 
+def sort_hashes_cache(cache: dict, config: Config) -> dict:
+    logger.debug("Sorting hashes using strategy: %s", config.script.filter_mode)
+
+    filter_mode = config.script.filter_mode
+    # Pre-normalize priority paths to posix strings for faster matching
+    folder_priority = [str(Path(p).as_posix()) for p in config.script.folder_priority]
+
+    for file_hash, file_group in cache.get("hashes", {}).items():
+        items = list(file_group.items())
+
+        match filter_mode:
+            case FilterMode.OLDEST:
+                items.sort(key=lambda x: x[1]['mtime'])
+
+            case FilterMode.NEWEST:
+                items.sort(key=lambda x: x[1]['mtime'], reverse=True)
+
+            case FilterMode.FOLDER_PRIORITY:
+                def get_folder_score(path_str: str) -> int:
+                    # Check if any priority path is a parent of the current file path
+                    for i, priority_path in enumerate(folder_priority):
+                        if priority_path in path_str:
+                            return i
+                    return len(folder_priority)
+
+                items.sort(key=lambda x: get_folder_score(x[0]))
+
+            case FilterMode.NONE | None:
+                continue
+
+            case _:
+                logger.warning("Unknown filter mode: %s", filter_mode)
+                continue
+
+        # Rebuild the dictionary for this hash group with the new order
+        # The "keep" file is now at index 0
+        cache["hashes"][file_hash] = dict(items)
+
+    return cache
+
+
 def main():
     config = Config()
     cache_path = config.script.cache_file_path
@@ -234,6 +298,7 @@ def main():
 
     cache = build_files_cache(cache=cache, config=config)
     cache = build_hashes_cache(cache=cache, config=config)
+    # cache = sort_hashes_cache(cache=cache, config=config)
 
 
 def read_json_file(file_path: Path) -> dict | list | None:
