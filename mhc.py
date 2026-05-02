@@ -7,6 +7,7 @@
 """
 
 import cv2
+import datetime
 import imagehash
 import json
 import logging
@@ -22,6 +23,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from PIL import Image
+
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +57,8 @@ class LogSettings:
     folder: Path = Path(r"Logs")
     console_level: int = logging.DEBUG
     file_level: int = logging.DEBUG
-    date_format: str = "%Y-%m-%d %H:%M:%S"
-    message_format: str = "%(asctime)s.%(msecs)03d %(levelname)s [%(funcName)s] - %(message)s"
+    date_format: str = "%Y-%m-%dT%H:%M:%S"
+    message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(module)s:%(funcName)s - %(message)s"
     max_files: int | None = 10
     open_log_after_run: bool = False
 
@@ -226,29 +228,12 @@ def main():
     config = Config()
     cache_path = config.script.cache_file_path
 
-    cache = load_cache(cache_path)
+    cache = read_json_file(cache_path)
+    if not isinstance(cache, dict):
+        raise TypeError("Cache should be formatted as a dictionary.")
 
     cache = build_files_cache(cache=cache, config=config)
     cache = build_hashes_cache(cache=cache, config=config)
-
-
-def load_cache(file_path: Path) -> dict:
-    """
-    Returns an empty dict if the cache file does not exist, 
-    otherwise returns the parsed JSON content.
-    """
-    if not file_path.exists():
-        logger.debug("Cache file missing, initializing empty dict: %s", json.dumps(file_path.as_posix()))
-        data = {}
-    else:
-        data = read_json_file(file_path) or {}
-
-    if not isinstance(data, dict):
-        raise TypeError("Cache is expected to be formatted as a dictionary.")
-
-    data.setdefault("files", {})
-
-    return data
 
 
 def read_json_file(file_path: Path) -> dict | list | None:
@@ -266,60 +251,45 @@ def read_json_file(file_path: Path) -> dict | list | None:
 
     except json.JSONDecodeError as e:
         logger.error("Invalid JSON format in %s: %s", json.dumps(str(file_path)), e)
-        raise
+        return None
 
     except Exception as e:
         logger.error("Unexpected error reading %s: %s", json.dumps(str(file_path)), e)
-        raise
+        return None
 
 
 def write_json_file(file_path: Path, data: dict | list) -> bool:
     """
-    Writes data to a JSON file atomically, converting Path keys and values to strings.
+    Writes data to a JSON file atomically.
     """
-    file_path = file_path.absolute()
-    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path = Path(file_path).absolute()
 
-    def sanitize_data(obj):
-        if isinstance(obj, Path):
-            return obj.as_posix()
-        if isinstance(obj, dict):
-            return {
-                (k.as_posix() if isinstance(k, Path) else k): sanitize_data(v)
-                for k, v in obj.items()
-            }
-        if isinstance(obj, list):
-            return [sanitize_data(i) for i in obj]
-        return obj
+    if not file_path.parent.exists():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug("Created %s", json.dumps(str(file_path.parent.as_posix())))
 
     temp_file_path: Path | None = None
     try:
-        clean_data = sanitize_data(data)
-
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            dir=str(file_path.parent),
-            encoding='utf-8',
-            suffix=".tmp",
-            delete=False
-        ) as tf:
+        with tempfile.NamedTemporaryFile(mode='w', dir=str(file_path.parent), encoding='utf-8', suffix=".tmp", delete=False) as tf:
+            # Get file path from tempfile object
             temp_file_path = Path(tf.name)
-            json.dump(clean_data, tf, indent=4)
+            json.dump(data, tf, indent=4)
             tf.flush()
             os.fsync(tf.fileno())
 
+        # Atomic swap
         temp_file_path.replace(file_path)
-        logger.info("Successfully saved to %s", json.dumps(str(file_path.as_posix())))
+        logger.info("Successfully saved to %s", json.dumps(str(file_path)))
         return True
 
     except (KeyboardInterrupt, SystemExit):
-        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path.as_posix())))
+        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path)))
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         raise
 
     except Exception as e:
-        logger.error("Failed to write to %s: %s", json.dumps(str(file_path.as_posix())), e)
+        logger.error("Failed to write to %s: %s", json.dumps(str(file_path)), e)
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         return False
@@ -414,7 +384,7 @@ def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> N
             pass
 
 
-def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path | None:
+def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings, config: Config) -> Path | None:
     """Set up file and console logging with flexible modes and rotation."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     day_stamp = datetime.now().strftime("%Y%m%d")
@@ -428,7 +398,7 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path
         log_dir = log_dir.expanduser().resolve()
         if not log_dir.exists():
             log_dir.mkdir(parents=True, exist_ok=True)
-            logger.debug("Created log folder: %s", log_dir.as_posix())
+            logger_obj.debug("Created log folder: %s", log_dir.as_posix())
 
         match log_settings.mode:
             case "per_run":
@@ -470,6 +440,7 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path
                     mode=file_mode,
                     encoding="utf-8",
                 )
+
     if file_handler:
         file_handler.setLevel(log_settings.file_level)
         file_handler.setFormatter(formatter)
@@ -481,8 +452,11 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path
     console_handler.setFormatter(formatter)
     logger_obj.addHandler(console_handler)
 
+    # Write the banner after handlers are attached
+    write_banner(logger_obj, config)
+
     # Flush logs buffer from prior to logging initialization
-    if "log_buffer" in globals():
+    if "log_buffer" in globals() and 'log_buffer' in globals():
         class _ForwardToLogger(logging.Handler):
             def emit(self, record):
                 logger_obj.handle(record)
@@ -492,7 +466,7 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path
         log_buffer.flush()
         log_buffer.close()
 
-    # Enforce max log count (except per_day which rotates automatically)
+    # Enforce max log count
     if log_settings.max_files and log_path and log_settings.mode not in ("per_day", "ConsoleOnly"):
         try:
             enforce_max_log_count(
@@ -506,27 +480,48 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path
     return log_path
 
 
+def write_banner(logger_obj: logging.Logger, config: Config):
+    """Writes a clean, unformatted session header directly to the output streams."""
+    script_name = Path(__file__).name
+    separator = "-" * 80
+    header_text = (
+        f"{separator}\n"
+        f"SCRIPT          | {json.dumps(str(script_name))}\n"
+        f"VERSION         | {__version__}\n"
+        f"USER/HOST       | {os.getlogin()} on {socket.gethostname()}\n"
+        f"EXECUTION START | {datetime.now().isoformat(sep='T', timespec='milliseconds')}\n"
+        f"DIRECTORY       | {json.dumps(str(Path.cwd().as_posix()))}\n"
+        f"PLATFORM        | {platform.system()} {platform.release()}\n"
+        f"RUNTIME         | Python {sys.version.split()[0]}\n"
+        f"{separator}\n"
+    )
+
+    for handler in logger_obj.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            try:
+                handler.stream.write(header_text)
+                handler.flush()
+            except Exception:
+                continue
+
+
 def bootstrap():
     exit_code = 0
     log_path = None
     script_path = Path(__file__)
 
-    logger.info("=" * 80)
-
+    # 1. Initialize Config First
     config = Config()
     config_path = script_path.with_name(f"{script_path.stem}_config.json")
-    global_settings = InternalSettings()
-    if global_settings.use_config_file:
+    if InternalSettings().use_config_file:
         config = load_config(config_path)
 
     try:
-        log_path = setup_logging(logger_obj=logger, log_settings=config.logs)
-        logger.info("%-10s %s", "Version:", __version__)
-        logger.info("%-10s %s on %s", "User/Host:", os.getlogin(), socket.gethostname())
-        logger.info("%-10s %s %s (v%s)", "Platform:", platform.system(), platform.release(), platform.version())
-        logger.info("%-10s Python %s", "Runtime:", sys.version.split()[0])
-        logger.info("%-10s %s", "Directory:", Path.cwd().as_posix())
-        logger.info("%-10s %s", "AppConfig:", config)
+        # 2. Setup Logging (This now handles the banner)
+        log_path = setup_logging(logger_obj=logger, log_settings=config.logs, config=config)
+
+        # 3. Only log dynamic app data here
+        logger.info("Configuration loaded: %s", config)
 
         main()
 
