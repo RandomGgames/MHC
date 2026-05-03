@@ -110,8 +110,24 @@ def generate_fast_hash(file_path: Path, image_exts: set, video_exts: set):
 def get_fast_image_hash(file_path: Path):
     try:
         with Image.open(file_path) as img:
-            img = img.convert("L").resize((32, 32), Image.Resampling.NEAREST)
-            return str(imagehash.phash(img))
+            # Helper to perform the hash
+            def compute(image_obj):
+                # Using BILINEAR to prevent "all zeros" from aliasing artifacts
+                temp = image_obj.convert("L").resize((32, 32), Image.Resampling.BILINEAR)
+                return imagehash.phash(temp)
+
+            h = compute(img)
+
+            # If hash is all zeros and image has transparency, retry with a white background
+            if str(h) == '0000000000000000' and img.mode in ("RGBA", "LA", "P"):
+                # Create white background
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                # Composite original image over white
+                bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").getchannel('A'))
+                h = compute(bg)
+
+            return str(h)
+
     except Exception as e:
         logger.error("Image hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
         raise
@@ -254,36 +270,45 @@ def sort_hashes_cache(cache: dict, config: Config) -> dict:
     # Pre-normalize priority paths to posix strings for faster matching
     folder_priority = [str(Path(p).as_posix()) for p in config.script.folder_priority]
 
-    for file_hash, file_group in cache.get("hashes", {}).items():
-        items = list(file_group.items())
+    def get_folder_score(path_str: str) -> int:
+        # Check if any priority path is a parent of the current file path
+        for i, priority_path in enumerate(folder_priority):
+            if priority_path in path_str:
+                return i
+        return len(folder_priority)
 
-        match filter_mode:
-            case FilterMode.OLDEST:
-                items.sort(key=lambda x: x[1]['mtime'])
+    match filter_mode:
+        case FilterMode.OLDEST:
+            for file_hash, file_dicts in cache.get("hashes", {}).items():
+                items = list(file_dicts.items())
+            items.sort(key=lambda x: x[1]['mtime'])
+            cache["hashes"][file_hash] = dict(items)
 
-            case FilterMode.NEWEST:
-                items.sort(key=lambda x: x[1]['mtime'], reverse=True)
+        case FilterMode.NEWEST:
+            for file_hash, file_dicts in cache.get("hashes", {}).items():
+                items = list(file_dicts.items())
+            items.sort(key=lambda x: x[1]['mtime'], reverse=True)
+            cache["hashes"][file_hash] = dict(items)
 
-            case FilterMode.FOLDER_PRIORITY:
-                def get_folder_score(path_str: str) -> int:
-                    # Check if any priority path is a parent of the current file path
-                    for i, priority_path in enumerate(folder_priority):
-                        if priority_path in path_str:
-                            return i
-                    return len(folder_priority)
+        case FilterMode.FOLDER_PRIORITY:
+            all_media_folders = set()
+            for file_hash, file_dicts in cache.get("hashes", {}).items():
+                for file_path in file_dicts.keys():
+                    all_media_folders.add(Path(file_path).parent)
+            missing_paths = list(set(str(p.as_posix()) for p in all_media_folders if str(p.as_posix()) not in folder_priority))
+            if len(missing_paths) != 0:
+                raise ValueError(f"Config folder_priority is missing the following folders:\n{json.dumps(missing_paths, indent=" " * 4)}\nThey must be added before sorting can continue.")
 
-                items.sort(key=lambda x: get_folder_score(x[0]))
+            for file_hash, file_group in cache.get("hashes", {}).items():
+                items = list(file_group.items())
+            items.sort(key=lambda x: get_folder_score(x[0]))
+            cache["hashes"][file_hash] = dict(items)
 
-            case FilterMode.NONE | None:
-                continue
+        case FilterMode.NONE | None:
+            pass
 
-            case _:
-                logger.warning("Unknown filter mode: %s", filter_mode)
-                continue
-
-        # Rebuild the dictionary for this hash group with the new order
-        # The "keep" file is now at index 0
-        cache["hashes"][file_hash] = dict(items)
+        case _:
+            raise ValueError(f"Unknown filter mode: {json.dumps(str(filter_mode))}")
 
     return cache
 
@@ -292,13 +317,19 @@ def main():
     config = Config()
     cache_path = config.script.cache_file_path
 
-    cache = read_json_file(cache_path)
+    try:
+        cache = read_json_file(cache_path)
+    except FileNotFoundError:
+        logger.debug("Initialized new blank cache...")
+        cache = {}
     if not isinstance(cache, dict):
         raise TypeError("Cache should be formatted as a dictionary.")
+    cache.setdefault("files", {})
+    cache.setdefault("hashes", {})
 
     cache = build_files_cache(cache=cache, config=config)
     cache = build_hashes_cache(cache=cache, config=config)
-    # cache = sort_hashes_cache(cache=cache, config=config)
+    cache = sort_hashes_cache(cache=cache, config=config)
 
 
 def read_json_file(file_path: Path) -> dict | list | None:
