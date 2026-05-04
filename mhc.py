@@ -269,6 +269,8 @@ def build_files_cache(cache: dict, config: Config) -> dict:
 def build_hashes_cache(cache: dict, config: Config) -> dict:
     cache["hashes"] = {}
 
+    cache_path = config.script.cache_file_path
+
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data["hash"]
 
@@ -281,7 +283,6 @@ def build_hashes_cache(cache: dict, config: Config) -> dict:
             "size": file_data["size"],
             "mtime": file_data["mtime"]
         }
-    cache_path = config.script.cache_file_path
     write_json_file(cache_path, cache)
     return cache
 
@@ -289,43 +290,48 @@ def build_hashes_cache(cache: dict, config: Config) -> dict:
 def sort_hashes_cache(cache: dict, config: Config) -> dict:
     logger.debug("Sorting hashes using strategy: %s", config.script.filter_mode)
 
+    cache_path = config.script.cache_file_path
     filter_mode = config.script.filter_mode
-    # Pre-normalize priority paths to posix strings for faster matching
+    # Ensure paths are standardized for comparison
     folder_priority = [str(Path(p).as_posix()) for p in config.script.folder_priority]
 
     def get_folder_score(path_str: str) -> int:
-        # Check if any priority path is a parent of the current file path
+        path_posix = str(Path(path_str).as_posix())
         for i, priority_path in enumerate(folder_priority):
-            if priority_path in path_str:
+            if priority_path in path_posix:
                 return i
         return len(folder_priority)
 
+    hashes_data = cache.get("hashes", {})
+
     match filter_mode:
         case FilterMode.OLDEST:
-            for file_hash, file_dicts in cache.get("hashes", {}).items():
-                items = list(file_dicts.items())
-            items.sort(key=lambda x: x[1]['mtime'])
-            cache["hashes"][file_hash] = dict(items)
+            for file_hash, file_dicts in hashes_data.items():
+                items = sorted(file_dicts.items(), key=lambda x: x[1]['mtime'])
+                hashes_data[file_hash] = dict(items)
 
         case FilterMode.NEWEST:
-            for file_hash, file_dicts in cache.get("hashes", {}).items():
-                items = list(file_dicts.items())
-            items.sort(key=lambda x: x[1]['mtime'], reverse=True)
-            cache["hashes"][file_hash] = dict(items)
+            for file_hash, file_dicts in hashes_data.items():
+                items = sorted(file_dicts.items(), key=lambda x: x[1]['mtime'], reverse=True)
+                hashes_data[file_hash] = dict(items)
 
         case FilterMode.FOLDER_PRIORITY:
+            # --- Validation Step ---
             all_media_folders = set()
-            for file_hash, file_dicts in cache.get("hashes", {}).items():
+            for file_dicts in hashes_data.values():
                 for file_path in file_dicts.keys():
-                    all_media_folders.add(Path(file_path).parent)
-            missing_paths = sorted(list(set(str(p.as_posix()) for p in all_media_folders if str(p.as_posix()) not in folder_priority)))
-            if len(missing_paths) != 0:
-                raise ValueError(f"Config folder_priority is missing the following folders:\n{json.dumps(missing_paths, indent=" " * 4)}\nThey must be added before sorting can continue.")
+                    all_media_folders.add(str(Path(file_path).parent.as_posix()))
 
-            for file_hash, file_group in cache.get("hashes", {}).items():
-                items = list(file_group.items())
-            items.sort(key=lambda x: get_folder_score(x[0]))
-            cache["hashes"][file_hash] = dict(items)
+            missing_paths = sorted([p for p in all_media_folders if p not in folder_priority])
+
+            if missing_paths:
+                raise ValueError(f"Config folder_priority is missing folders:\n{json.dumps(missing_paths, indent=4)}")
+
+            # --- Sorting Step ---
+            for file_hash, file_group in hashes_data.items():
+                # Corrected: Indented inside the loop and removed reverse=True
+                items = sorted(file_group.items(), key=lambda x: get_folder_score(x[0]))
+                hashes_data[file_hash] = dict(items)
 
         case FilterMode.NONE | None:
             pass
@@ -333,6 +339,7 @@ def sort_hashes_cache(cache: dict, config: Config) -> dict:
         case _:
             raise ValueError(f"Unknown filter mode: {json.dumps(str(filter_mode))}")
 
+    write_json_file(cache_path, cache)
     return cache
 
 
