@@ -17,6 +17,7 @@ import platform
 import socket
 import sys
 import tempfile
+import time
 import typing
 from dataclasses import dataclass, field, fields, asdict
 from datetime import datetime
@@ -50,7 +51,7 @@ class FilterMode:
 
 @dataclass
 class ScriptSettings:
-    media_dir_path = Path(r"H:\Media Backup")
+    media_dir_path = Path(r"media")
     filter_mode = FilterMode.FOLDER_PRIORITY
     folder_priority = [
         Path(r"")
@@ -157,60 +158,80 @@ def get_fast_video_hash(file_path: Path):
         cap.release()
 
 
-def iter_media_files(media_dir: Path, valid_exts: set, ignore_files_containing: list, resolve_path: bool = False):
+def iter_files(root_dir: Path, valid_exts: set, ignore_list: list):
     """
-    Scans media_dir recursively and yields valid Path objects.
+    Scans root_dir recursively and yields absolute Path objects.
 
-    - valid_exts: A set of lowercase extensions like {'.jpg', '.mp4'}
-    - ignore_list: A list of strings to check against the full file path.
+    - root_dir: The starting Path object.
+    - valid_exts: A set of extensions including the dot (e.g., {'.txt', '.jpg'}).
+    - ignore_list: A list of strings; if found in the path, the file is skipped.
     """
-    # rglob('*') finds everything recursively
-    for path in media_dir.rglob("*"):
+    root_dir = Path(root_dir).resolve()
+
+    for path in root_dir.rglob("*"):
         if not path.is_file():
             continue
 
         if path.suffix.lower() not in valid_exts:
             continue
 
-        full_path_str = str(path.resolve())
-        if any(ignore_str in full_path_str for ignore_str in ignore_files_containing):
+        resolved_path = path.resolve()
+        path_str = resolved_path.as_posix()
+
+        if any(ignore_str in path_str for ignore_str in ignore_list):
             continue
 
-        if resolve_path:
-            path = path.resolve()
-
-        yield path
+        yield resolved_path
 
 
 def build_files_cache(cache: dict, config: Config) -> dict:
     logger.debug("Building files cache...")
+
+    # 1. Configuration & Setup
     cache_path = config.script.cache_file_path
     save_cache_frequency = config.script.save_cache_frequency
     remove_deleted = config.script.remove_deleted_files_from_cache
 
-    media_dir = config.script.media_dir_path
-    ignore_files_containing = config.script.ignore_files_containing
+    root_dir = config.script.media_dir_path
+    ignore_list = config.script.ignore_files_containing
 
     image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
     video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
     valid_exts = image_exts | video_exts
 
-    cache_updates = 0
+    # Ensure cache structure exists
+    if "files" not in cache:
+        cache["files"] = {}
 
+    cache_updates = 0
     seen_paths = set()
-    for file_path in iter_media_files(media_dir, valid_exts, ignore_files_containing, resolve_path=True):
+    files_scanned = 0
+    last_status_message_time = time.time()
+
+    # 2. Scan and Update Loop
+    for file_path in iter_files(root_dir, valid_exts, ignore_list):
+        files_scanned += 1
+
+        # Periodic status logging
+        if time.time() - last_status_message_time >= 1.5:
+            logger.debug("Scanned %s files...", files_scanned)
+            last_status_message_time = time.time()
+
         try:
-            path_str = str(file_path.as_posix())
-            seen_paths.add(path_str)  # Mark this file as "alive"
+            # Consistent path string for cache keys
+            path_str = file_path.as_posix()
+            seen_paths.add(path_str)
 
             file_stats = file_path.stat()
             size, mtime = file_stats.st_size, file_stats.st_mtime
 
+            # Check if cache is already up to date
             if path_str in cache["files"]:
                 entry = cache["files"][path_str]
-                if entry["size"] == size and entry["mtime"] == mtime:
+                if entry.get("size") == size and entry.get("mtime") == mtime:
                     continue
 
+            # Generate hash for new or changed files
             file_hash = generate_fast_hash(file_path, image_exts=image_exts, video_exts=video_exts)
             if file_hash:
                 cache["files"][path_str] = {
@@ -218,25 +239,27 @@ def build_files_cache(cache: dict, config: Config) -> dict:
                     "size": size,
                     "mtime": mtime,
                 }
-                logger.debug("Hashed: %s: %s", json.dumps(path_str), file_hash)
+                logger.debug("Hashed: %s", path_str)
                 cache_updates += 1
 
         except Exception as e:
-            logger.error("Failed to process %s: %s", json.dumps(str(file_path.as_posix())), e)
+            logger.error("Failed to process %s: %s", file_path, e)
             continue
 
-        if cache_updates >= save_cache_frequency:
+        # Incremental save
+        if cache_updates >= save_cache_frequency > 0:
             write_json_file(cache_path, cache)
             cache_updates = 0
 
     if remove_deleted:
-        cached_paths = list(cache["files"].keys())
-        for path in cached_paths:
-            if path not in seen_paths:
-                logger.debug("Removing stale entry from cache: %s", json.dumps(str(path)))
-                del cache["files"][path]
+        cached_keys = list(cache["files"].keys())
+        for path_key in cached_keys:
+            if path_key not in seen_paths:
+                logger.debug("Removing stale entry from cache: %s", path_key)
+                del cache["files"][path_key]
                 cache_updates += 1
 
+    # Final save if there are pending changes
     if cache_updates > 0:
         write_json_file(cache_path, cache)
 
@@ -244,7 +267,6 @@ def build_files_cache(cache: dict, config: Config) -> dict:
 
 
 def build_hashes_cache(cache: dict, config: Config) -> dict:
-    cache.setdefault("hashes", {})
 
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data["hash"]
@@ -295,7 +317,7 @@ def sort_hashes_cache(cache: dict, config: Config) -> dict:
             for file_hash, file_dicts in cache.get("hashes", {}).items():
                 for file_path in file_dicts.keys():
                     all_media_folders.add(Path(file_path).parent)
-            missing_paths = list(set(str(p.as_posix()) for p in all_media_folders if str(p.as_posix()) not in folder_priority))
+            missing_paths = sorted(list(set(str(p.as_posix()) for p in all_media_folders if str(p.as_posix()) not in folder_priority)))
             if len(missing_paths) != 0:
                 raise ValueError(f"Config folder_priority is missing the following folders:\n{json.dumps(missing_paths, indent=" " * 4)}\nThey must be added before sorting can continue.")
 
