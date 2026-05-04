@@ -267,6 +267,7 @@ def build_files_cache(cache: dict, config: Config) -> dict:
 
 
 def build_hashes_cache(cache: dict, config: Config) -> dict:
+    cache["hashes"] = {}
 
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data["hash"]
