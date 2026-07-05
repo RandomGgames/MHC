@@ -13,33 +13,31 @@ import json
 import logging
 import logging.handlers
 import os
-import platform
 import socket
 import sys
 import tempfile
 import time
 import typing
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from PIL import Image
+from send2trash import send2trash
 
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.2.0"  # Major.Minor.Patch
+__version__ = "1.2.1"  # Major.Minor.Patch
 
-logger = logging.getLogger(__name__)
 log_buffer = logging.handlers.MemoryHandler(
     capacity=0,
     flushLevel=logging.CRITICAL,
     target=None,
 )
+
 logger.addHandler(log_buffer)
 logger.setLevel(logging.DEBUG)
-
-cache = {}
 
 
 class FilterMode:
@@ -53,10 +51,8 @@ class FilterMode:
 class ScriptSettings:
     media_dir_path = Path(r"media")
     filter_mode = FilterMode.FOLDER_PRIORITY
-    folder_priority = [
-        Path(r"")
-    ]
-    remove_deleted_files_from_cache = True
+    folder_priority = []
+    remove_deleted_files_from_cache = False
     save_cache_frequency = 100  # files scanned
     cache_file_path = Path(r"cache.json")
     ignore_files_containing = ["$", "System"]
@@ -64,19 +60,15 @@ class ScriptSettings:
 
 @dataclass
 class LogSettings:
-    mode: typing.Literal["per_run", "latest", "per_day", "single_file", "ConsoleOnly"] = "latest"
-    folder: Path = Path(r"Logs")
+    mode: typing.Literal["per_run", "latest", "per_day", "single_file", "console_only"] = "per_run"
+    folder: Path = Path("Logs")
     console_level: int = logging.DEBUG
     file_level: int = logging.DEBUG
     date_format: str = "%Y-%m-%dT%H:%M:%S"
-    message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(module)s:%(funcName)s - %(message)s"
-    max_files: int | None = 10
+    message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(message)s"
+    # message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(module)s:%(funcName)s - %(message)s"
+    max_files: int | None = 15
     open_log_after_run: bool = False
-
-
-@dataclass
-class InternalSettings:
-    use_config_file: bool = False
 
 
 @dataclass
@@ -87,9 +79,9 @@ class RuntimeSettings:
 
 @dataclass
 class Config:
-    script: ScriptSettings = field(default_factory=ScriptSettings)
-    logs: LogSettings = field(default_factory=LogSettings)
-    runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+    script_settings: ScriptSettings = field(default_factory=ScriptSettings)
+    log_settings: LogSettings = field(default_factory=LogSettings)
+    runtime_settings: RuntimeSettings = field(default_factory=RuntimeSettings)
 
 
 class HashGenerationError(Exception):
@@ -113,14 +105,16 @@ def get_fast_image_hash(file_path: Path):
         with Image.open(file_path) as img:
             # Helper to perform the hash
             def compute(image_obj):
-                # Using BILINEAR to prevent "all zeros" from aliasing artifacts
-                temp = image_obj.convert("L").resize((32, 32), Image.Resampling.BILINEAR)
-                return imagehash.phash(temp)
+                # We scale up the resize to 64x64 to supply enough pixel data
+                # for a higher-fidelity 16x16 perceptual hash matrix.
+                temp = image_obj.convert("L").resize((64, 64), Image.Resampling.BILINEAR)
+                return imagehash.phash(temp, hash_size=16)
 
             h = compute(img)
 
-            # If hash is all zeros and image has transparency, retry with a white background
-            if str(h) == '0000000000000000' and img.mode in ("RGBA", "LA", "P"):
+            # A hash_size=16 generates a 256-bit hash, represented as 64 hex characters.
+            # We adjust the 'all zeros' check to look for 64 zeros.
+            if str(h) == ('0' * 64) and img.mode in ("RGBA", "LA", "P"):
                 # Create white background
                 bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
                 # Composite original image over white
@@ -128,23 +122,22 @@ def get_fast_image_hash(file_path: Path):
                 h = compute(bg)
 
             return str(h)
-
     except Exception as e:
-        logger.error("Image hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
-        raise
+        logger.error("Failed to hash %s: %s", file_path, e)
+        return None
 
 
 def get_fast_video_hash(file_path: Path):
     cap = cv2.VideoCapture(str(file_path.resolve()))
 
     if not cap.isOpened():
-        logger.error("OpenCV could not open %s", json.dumps(str(file_path.as_posix())))
+        logger.error("OpenCV could not open %s", file_path)
         raise HashGenerationError("OpenCV open failure")
 
     try:
         success, frame = cap.read()
         if not success or frame is None:
-            logger.error("Could not read frame from %s", json.dumps(str(file_path.as_posix())))
+            logger.error("Could not read frame from %s", file_path)
             raise HashGenerationError("Frame read failure")
 
         small_frame = cv2.resize(frame, (32, 32), interpolation=cv2.INTER_NEAREST)
@@ -152,7 +145,7 @@ def get_fast_video_hash(file_path: Path):
         img = Image.fromarray(gray_frame)
         return str(imagehash.phash(img))
     except Exception as e:
-        logger.error("Video hash failed for %s: %s", json.dumps(str(file_path.as_posix())), e)
+        logger.error("Video hash failed for %s: %s", file_path, e)
         raise
     finally:
         cap.release()
@@ -188,12 +181,12 @@ def build_files_cache(cache: dict, config: Config) -> dict:
     logger.debug("Building files cache...")
 
     # 1. Configuration & Setup
-    cache_path = config.script.cache_file_path
-    save_cache_frequency = config.script.save_cache_frequency
-    remove_deleted = config.script.remove_deleted_files_from_cache
+    cache_path = config.script_settings.cache_file_path
+    save_cache_frequency = config.script_settings.save_cache_frequency
+    remove_deleted = config.script_settings.remove_deleted_files_from_cache
 
-    root_dir = config.script.media_dir_path
-    ignore_list = config.script.ignore_files_containing
+    root_dir = config.script_settings.media_dir_path
+    ignore_list = config.script_settings.ignore_files_containing
 
     image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'}
     video_exts = {'.mp4', '.mkv', '.mov', '.avi', '.gif', '.wmv'}
@@ -254,7 +247,7 @@ def build_files_cache(cache: dict, config: Config) -> dict:
     if remove_deleted:
         cached_keys = list(cache["files"].keys())
         for path_key in cached_keys:
-            if path_key not in seen_paths:
+            if not Path(path_key).exists():
                 logger.debug("Removing stale entry from cache: %s", path_key)
                 del cache["files"][path_key]
                 cache_updates += 1
@@ -267,9 +260,10 @@ def build_files_cache(cache: dict, config: Config) -> dict:
 
 
 def build_hashes_cache(cache: dict, config: Config) -> dict:
-    cache["hashes"] = {}
+    logger.debug("Building hashes cache...")
 
-    cache_path = config.script.cache_file_path
+    cache["hashes"] = {}
+    cache_path = config.script_settings.cache_file_path
 
     for file_path, file_data in cache.get("files", {}).items():
         file_hash = file_data["hash"]
@@ -288,12 +282,12 @@ def build_hashes_cache(cache: dict, config: Config) -> dict:
 
 
 def sort_hashes_cache(cache: dict, config: Config) -> dict:
-    logger.debug("Sorting hashes using strategy: %s", config.script.filter_mode)
+    logger.debug("Sorting hashes using strategy: %s...", config.script_settings.filter_mode)
 
-    cache_path = config.script.cache_file_path
-    filter_mode = config.script.filter_mode
+    cache_path = config.script_settings.cache_file_path
+    filter_mode = config.script_settings.filter_mode
     # Ensure paths are standardized for comparison
-    folder_priority = [str(Path(p).as_posix()) for p in config.script.folder_priority]
+    folder_priority = [str(Path(p).as_posix()) for p in config.script_settings.folder_priority]
 
     def get_folder_score(path_str: str) -> int:
         path_posix = str(Path(path_str).as_posix())
@@ -343,9 +337,38 @@ def sort_hashes_cache(cache: dict, config: Config) -> dict:
     return cache
 
 
-def main():
-    config = Config()
-    cache_path = config.script.cache_file_path
+def build_duplicates_list(cache: dict, config: Config) -> dict:
+    logger.debug("Building duplicates cache...")
+    cache_path = config.script_settings.cache_file_path
+
+    cache["duplicates"] = []
+    for hash, images_data in cache["hashes"].items():
+        if len(images_data) <= 1:
+            continue
+
+        image_paths = list(images_data.keys())
+        # Log the file we are keeping
+        # logger.info("Keeping %s", image_paths[0])
+        # Loop through the rest, log them individually, and cache them
+        for image_path in image_paths[1:]:
+            # logger.info("    - Discarding %s", image_path)
+            cache["duplicates"].append(image_path)
+
+    logger.debug("Found %s duplicates.", len(cache["duplicates"]))
+    write_json_file(cache_path, cache)
+    return cache
+
+
+def remove_duplicates(cache):
+    logger.debug("Removing duplicates...")
+    for image_path in cache["duplicates"]:
+        image_path = Path(image_path)
+        send2trash(image_path)
+        logger.info("Sent %s to recycle bin", image_path)
+
+
+def main(config: Config):
+    cache_path = config.script_settings.cache_file_path
 
     try:
         cache = read_json_file(cache_path)
@@ -360,6 +383,8 @@ def main():
     cache = build_files_cache(cache=cache, config=config)
     cache = build_hashes_cache(cache=cache, config=config)
     cache = sort_hashes_cache(cache=cache, config=config)
+    cache = build_duplicates_list(cache=cache, config=config)
+    remove_duplicates(cache=cache)
 
 
 def read_json_file(file_path: Path) -> dict | list | None:
@@ -367,20 +392,20 @@ def read_json_file(file_path: Path) -> dict | list | None:
     Safely reads and parses a JSON file.
     """
     if not file_path.exists():
-        logger.warning("File not found: %s", json.dumps(str(file_path)))
+        logger.warning("File not found: %s", file_path)
         raise FileNotFoundError("File not found")
 
     try:
         data = json.loads(file_path.read_text(encoding='utf-8'))
-        logger.info("Successfully read data from %s", json.dumps(str(file_path)))
+        logger.info("Successfully read data from %s", file_path)
         return data
 
     except json.JSONDecodeError as e:
-        logger.error("Invalid JSON format in %s: %s", json.dumps(str(file_path)), e)
+        logger.error("Invalid JSON format in %s: %s", file_path, e)
         return None
 
     except Exception as e:
-        logger.error("Unexpected error reading %s: %s", json.dumps(str(file_path)), e)
+        logger.error("Unexpected error reading %s: %s", file_path, e)
         return None
 
 
@@ -392,7 +417,7 @@ def write_json_file(file_path: Path, data: dict | list) -> bool:
 
     if not file_path.parent.exists():
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        logger.debug("Created %s", json.dumps(str(file_path.parent.as_posix())))
+        logger.debug("Created %s", file_path.parent)
 
     temp_file_path: Path | None = None
     try:
@@ -405,98 +430,38 @@ def write_json_file(file_path: Path, data: dict | list) -> bool:
 
         # Atomic swap
         temp_file_path.replace(file_path)
-        logger.info("Successfully saved to %s", json.dumps(str(file_path)))
+        logger.info("Successfully saved to %s", file_path)
         return True
 
     except (KeyboardInterrupt, SystemExit):
-        logger.error("Write interrupted for %s. Cleaning up.", json.dumps(str(file_path)))
+        logger.error("Write interrupted for %s. Cleaning up.", file_path)
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         raise
 
     except Exception as e:
-        logger.error("Failed to write to %s: %s", json.dumps(str(file_path)), e)
+        logger.error("Failed to write to %s: %s", file_path, e)
         if temp_file_path and temp_file_path.exists():
             temp_file_path.unlink()
         return False
 
 
-def load_config(file_path: Path) -> Config:
-    config = Config()
-    needs_sync = False
-
-    try:
-        external_config = read_json_file(file_path)
-        if not isinstance(external_config, dict):
-            external_config = {}
-            needs_sync = True
-    except FileNotFoundError:
-        external_config = {}
-        needs_sync = True
-    except Exception:
-        raise
-
-    # Merge logic
-    for section in fields(config):
-        section_name = section.name
-        if section_name not in external_config:
-            needs_sync = True
-            continue
-
-        section_instance = getattr(config, section_name)
-        json_values = external_config[section_name]
-
-        for f in fields(section_instance):
-            if f.name in json_values:
-                val = json_values[f.name]
-                if f.type is Path and isinstance(val, str):
-                    val = Path(val)
-                setattr(section_instance, f.name, val)
-            else:
-                needs_sync = True
-
-    # Check for keys in external config that aren't in internal config
-    internal_field_names = {f.name for f in fields(config)}
-    if any(k for k in external_config if k not in internal_field_names):
-        needs_sync = True
-
-    if needs_sync:
-        def path_serializer(obj):
-            if isinstance(obj, Path):
-                return str(obj)
-            raise TypeError(f"Type {type(obj)} not serializable")
-
-        # We re-serialize the internal_config (which now has merged data)
-        # This naturally prunes extra keys because they weren't in the dataclass!
-        synced_config = json.loads(json.dumps(asdict(config), default=path_serializer))
-        write_json_file(file_path, synced_config)
-
-    return config
-
-
-def save_config(file_path: Path, config_data: dict | list) -> bool:
-    """Alias for write_json_file, specifically for configuration files."""
-    return write_json_file(file_path, config_data)
-
-
 def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
     """
     Enforce a maximum number of log files for this script.
-    Deletes the oldest logs based on filename ordering.
 
     Rules:
     - Only affects files ending with `.log`
-    - Only affects logs that contain the script_name
-    - Sorting is done by filename (lexicographically)
+    - Only affects logs that contain the script name
+    - Sorting is performed lexicographically by filename
     """
     if max_count <= 0:
         return
+
     if not dir_path.exists():
         return
-    log_files = [
-        f for f in dir_path.glob("*.log")
-        if script_name in f.name
-    ]
+
+    log_files = [f for f in dir_path.glob("*.log") if script_name in f.name]
     if len(log_files) <= max_count:
         return
     log_files.sort(key=lambda p: p.name)
@@ -504,85 +469,125 @@ def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> N
     for file in to_delete:
         try:
             file.unlink()
-            logger.debug("Removed %s", json.dumps(file.absolute().as_posix()))
-        except Exception:
-            # Avoid raising during bootstrap
-            pass
+            logger.debug("Removed old log %s", file)
+        except OSError as e:
+            logger.debug("Failed removing old log %s: %s", file, e)
 
 
-def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings, config: Config) -> Path | None:
-    """Set up file and console logging with flexible modes and rotation."""
+def build_log_path(log_settings: LogSettings) -> Path | None:
+    """
+    Builds the final log file path based on logging mode.
+    """
+    if log_settings.mode == "console_only":
+        return None
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     day_stamp = datetime.now().strftime("%Y%m%d")
+
     script_name = Path(__file__).stem
     pc_name = socket.gethostname()
 
-    log_path: Path | None = None
+    log_dir = Path(log_settings.folder).expanduser().resolve()
 
-    if log_settings.mode != "ConsoleOnly":
-        log_dir = (log_settings.folder if isinstance(log_settings.folder, Path) else Path(log_settings.folder))
-        log_dir = log_dir.expanduser().resolve()
-        if not log_dir.exists():
-            log_dir.mkdir(parents=True, exist_ok=True)
-            logger_obj.debug("Created log folder: %s", log_dir.as_posix())
+    match log_settings.mode:
+        case "per_run":
+            filename = f"{timestamp}__{script_name}__{pc_name}.log"
+        case "latest":
+            filename = f"latest_{script_name}__{pc_name}.log"
+        case "per_day":
+            filename = f"{day_stamp}__{script_name}__{pc_name}.log"
+        case "single_file":
+            filename = f"{script_name}__{pc_name}.log"
+        case _:
+            filename = f"{timestamp}__{script_name}__{pc_name}.log"
 
-        match log_settings.mode:
-            case "per_run":
-                log_path = log_dir / f"{timestamp}__{script_name}__{pc_name}.log"
-            case "latest":
-                log_path = log_dir / f"latest_{script_name}__{pc_name}.log"
-            case "per_day":
-                log_path = log_dir / f"{day_stamp}__{script_name}__{pc_name}.log"
-            case "single_file":
-                log_path = log_dir / f"{script_name}__{pc_name}.log"
-            case _:
-                log_path = log_dir / f"{timestamp}__{script_name}__{pc_name}.log"
+    return log_dir / filename
 
+
+class JsonArgsFilter(logging.Filter):
+    """
+    Automatically formats log arguments:
+    - Keeps numeric types intact (so %d / %.6f still work)
+    - Applies JSON-style formatting to Path and str (adds quotes)
+    - Safely serializes other objects
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.args:
+            return True
+
+        raw_args = list(record.args) if isinstance(record.args, tuple) else [record.args]
+        processed_args = []
+
+        for val in raw_args:
+            match val:
+                case Path():
+                    processed_args.append(json.dumps(val.as_posix()))
+
+                case str():
+                    processed_args.append(json.dumps(val))
+
+                case int() | float() | bool():
+                    processed_args.append(val)
+
+                case None:
+                    processed_args.append(val)
+
+                case _:
+                    processed_args.append(json.dumps(val, default=str))
+
+        record.args = tuple(processed_args)
+        return True
+
+
+def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings) -> Path | None:
+    """
+    Set up console and file logging.
+    """
     logger_obj.handlers.clear()
     logger_obj.setLevel(logging.DEBUG)
+    logger_obj.propagate = False
 
-    # Formatter
+    # Attach the automatic JSON formatting filter
+    logger_obj.addFilter(JsonArgsFilter())
+
+    log_path = build_log_path(log_settings)
+
     formatter = logging.Formatter(
         log_settings.message_format,
         datefmt=log_settings.date_format,
     )
 
-    # File handler
-    file_handler: logging.Handler | None = None
     if log_path:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        except OSError as e:
+            raise RuntimeError(f"Failed creating log directory {log_path.parent}") from e
+
+        file_handler: logging.Handler
+
         match log_settings.mode:
             case "per_day":
-                file_handler = TimedRotatingFileHandler(
-                    filename=log_path,
-                    when="midnight",
-                    interval=1,
-                    backupCount=log_settings.max_files or 0,
-                    encoding="utf-8",
-                )
-            case "single_file" | "latest" | "per_run":
-                file_mode = "a" if log_settings.mode == "single_file" else "w"
-                file_handler = logging.FileHandler(
-                    log_path,
-                    mode=file_mode,
-                    encoding="utf-8",
-                )
+                file_handler = TimedRotatingFileHandler(filename=log_path, when="midnight", interval=1, backupCount=log_settings.max_files or 0, encoding="utf-8")
+            case "single_file":
+                file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            case _:
+                file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
 
-    if file_handler:
         file_handler.setLevel(log_settings.file_level)
         file_handler.setFormatter(formatter)
         logger_obj.addHandler(file_handler)
 
-    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(log_settings.console_level)
     console_handler.setFormatter(formatter)
+
     logger_obj.addHandler(console_handler)
 
-    # Write the banner after handlers are attached
-    write_banner(logger_obj, config)
+    write_banner(logger_obj)
 
-    # Flush logs buffer from prior to logging initialization
-    if "log_buffer" in globals() and 'log_buffer' in globals():
+    if log_buffer:
         class _ForwardToLogger(logging.Handler):
             def emit(self, record):
                 logger_obj.handle(record)
@@ -592,89 +597,82 @@ def setup_logging(logger_obj: logging.Logger, log_settings: LogSettings, config:
         log_buffer.flush()
         log_buffer.close()
 
-    # Enforce max log count
-    if log_settings.max_files and log_path and log_settings.mode not in ("per_day", "ConsoleOnly"):
-        try:
-            enforce_max_log_count(
-                dir_path=log_path.parent,
-                max_count=log_settings.max_files,
-                script_name=script_name,
-            )
-        except Exception as e:
-            logger_obj.debug("Log pruning skipped: %s", e)
+    if (log_settings.max_files and log_path and log_settings.mode not in ("per_day", "console_only")):
+        enforce_max_log_count(dir_path=log_path.parent, max_count=log_settings.max_files, script_name=Path(__file__).stem)
 
     return log_path
 
 
-def write_banner(logger_obj: logging.Logger, config: Config):
-    """Writes a clean, unformatted session header directly to the output streams."""
-    script_name = Path(__file__).name
+def write_banner(logger_obj: logging.Logger):
+    """
+    Writes a clean session banner without log prefixes.
+    """
     separator = "-" * 80
-    header_text = (
+
+    banner = (
         f"{separator}\n"
-        f"SCRIPT          | {json.dumps(str(script_name))}\n"
-        f"VERSION         | {__version__}\n"
-        f"USER/HOST       | {os.getlogin()} on {socket.gethostname()}\n"
-        f"EXECUTION START | {datetime.now().isoformat(sep='T', timespec='milliseconds')}\n"
-        f"DIRECTORY       | {json.dumps(str(Path.cwd().as_posix()))}\n"
-        f"PLATFORM        | {platform.system()} {platform.release()}\n"
-        f"RUNTIME         | Python {sys.version.split()[0]}\n"
-        f"{separator}\n"
+        f"SCRIPT     | {json.dumps(Path(__file__).resolve().as_posix())}\n"
+        f"VERSION    | {__version__}\n"
+        f"START TIME | {datetime.now().isoformat(timespec='milliseconds')}\n"
+        f"USER       | {os.getlogin()}\n"
+        f"HOST       | {socket.gethostname()}\n"
+        f"RUNTIME    | Python {sys.version.split()[0]}\n"
+        f"{separator}"
     )
 
-    for handler in logger_obj.handlers:
-        if isinstance(handler, logging.StreamHandler):
-            try:
-                handler.stream.write(header_text)
-                handler.flush()
-            except Exception:
-                continue
+    original_formatters = {}
+
+    class RawFormatter(logging.Formatter):
+        """
+        Formatter that outputs only the log message with no prefixes.
+        """
+
+        def format(self, record):
+            return record.getMessage()
+
+    try:
+        for handler in logger_obj.handlers:
+            original_formatters[handler] = handler.formatter
+            handler.setFormatter(RawFormatter())
+
+        logger_obj.info(banner)
+
+    finally:
+        for handler, formatter in original_formatters.items():
+            handler.setFormatter(formatter)
 
 
 def bootstrap():
     exit_code = 0
-    log_path = None
-    script_path = Path(__file__)
-
-    # 1. Initialize Config First
+    log_path: Path | None = None
     config = Config()
-    config_path = script_path.with_name(f"{script_path.stem}_config.json")
-    if InternalSettings().use_config_file:
-        config = load_config(config_path)
 
     try:
-        # 2. Setup Logging (This now handles the banner)
-        log_path = setup_logging(logger_obj=logger, log_settings=config.logs, config=config)
-
-        # 3. Only log dynamic app data here
-        logger.info("Configuration loaded: %s", config)
-
-        main()
+        log_path = setup_logging(logger_obj=logger, log_settings=config.log_settings)
+        main(config)
 
     except KeyboardInterrupt:
         logger.warning("Operation interrupted by user.")
         exit_code = 130
+
     except Exception as e:
         logger.exception("A fatal error has occurred: %s", e)
         exit_code = 1
-    finally:
-        for handler in logger.handlers[:]:
-            handler.close()
-            logger.removeHandler(handler)
 
-    if config.logs.open_log_after_run and log_path and log_path.exists():
+    if (config.log_settings.open_log_after_run and log_path and log_path.exists()):
         try:
             match sys.platform:
-                case plat if plat.startswith("win"):  # Windows
+                case plat if plat.startswith("win"):
                     os.startfile(log_path)
-                case "darwin":  # macOS
+                case "darwin":
                     os.system(f'open "{log_path}"')
-                case _:  # Linux / others
+                case _:
                     os.system(f'xdg-open "{log_path}"')
+
         except Exception as e:
             logger.warning("Failed to open log file: %s", e)
 
-    if config.runtime.always_pause or (config.runtime.pause_on_error and exit_code != 0):
+    if (config.runtime_settings.always_pause or (config.runtime_settings.pause_on_error and exit_code != 0)):
         input("Press Enter to exit...")
 
     return exit_code
