@@ -28,7 +28,7 @@ from send2trash import send2trash
 
 logger = logging.getLogger(__name__)
 
-__version__ = "1.2.1"  # Major.Minor.Patch
+__version__ = "1.2.2"  # Major.Minor.Patch
 
 log_buffer = logging.handlers.MemoryHandler(
     capacity=0,
@@ -49,12 +49,13 @@ class FilterMode:
 
 @dataclass
 class ScriptSettings:
+    cache_file_path = Path(r"cache.json")
     media_dir_path = Path(r"media")
+    remove_deleted_files_from_cache = False
     filter_mode = FilterMode.FOLDER_PRIORITY
     folder_priority = []
-    remove_deleted_files_from_cache = False
+
     save_cache_frequency = 100  # files scanned
-    cache_file_path = Path(r"cache.json")
     ignore_files_containing = ["$", "System"]
 
 
@@ -103,21 +104,27 @@ def generate_fast_hash(file_path: Path, image_exts: set, video_exts: set):
 def get_fast_image_hash(file_path: Path):
     try:
         with Image.open(file_path) as img:
-            # Helper to perform the hash
+            # Standardize to RGB first so getextrema() consistently
+            # returns a 3-element tuple of (min, max) pairs.
+            rgb_img = img.convert("RGB")
+            extrema: tuple[tuple[int, int], tuple[int, int], tuple[int, int]] = rgb_img.getextrema()  # type: ignore
+
+            # If min == max for all channels, the image is a solid uniform color
+            if all(band_min == band_max for band_min, band_max in extrema):
+                r = extrema[0][0]
+                g = extrema[1][0]
+                b = extrema[2][0]
+                return f"solid_{r:02x}{g:02x}{b:02x}"
+
+            # Helper to perform the hash for non-solid images
             def compute(image_obj):
-                # We scale up the resize to 64x64 to supply enough pixel data
-                # for a higher-fidelity 16x16 perceptual hash matrix.
                 temp = image_obj.convert("L").resize((64, 64), Image.Resampling.BILINEAR)
                 return imagehash.phash(temp, hash_size=16)
 
             h = compute(img)
 
-            # A hash_size=16 generates a 256-bit hash, represented as 64 hex characters.
-            # We adjust the 'all zeros' check to look for 64 zeros.
             if str(h) == ('0' * 64) and img.mode in ("RGBA", "LA", "P"):
-                # Create white background
                 bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                # Composite original image over white
                 bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").getchannel('A'))
                 h = compute(bg)
 
@@ -266,6 +273,9 @@ def build_hashes_cache(cache: dict, config: Config) -> dict:
     cache_path = config.script_settings.cache_file_path
 
     for file_path, file_data in cache.get("files", {}).items():
+        if not Path(file_path).exists():
+            continue
+
         file_hash = file_data["hash"]
 
         # Initialize the hash bucket if it doesn't exist
@@ -348,10 +358,10 @@ def build_duplicates_list(cache: dict, config: Config) -> dict:
 
         image_paths = list(images_data.keys())
         # Log the file we are keeping
-        # logger.info("Keeping %s", image_paths[0])
+        logger.info("Keeping %s", image_paths[0])
         # Loop through the rest, log them individually, and cache them
         for image_path in image_paths[1:]:
-            # logger.info("    - Discarding %s", image_path)
+            logger.info("    - Discarding %s", image_path)
             cache["duplicates"].append(image_path)
 
     logger.debug("Found %s duplicates.", len(cache["duplicates"]))
