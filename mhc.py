@@ -6,9 +6,10 @@
 {How to use the script}
 """
 
-import cv2
-import datetime
-import imagehash
+from dataclasses import dataclass, field
+from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 import json
 import logging
 import logging.handlers
@@ -18,13 +19,11 @@ import sys
 import tempfile
 import time
 import typing
-from dataclasses import dataclass, field
-from datetime import datetime
-from logging.handlers import TimedRotatingFileHandler
-from pathlib import Path
+
 from PIL import Image
 from send2trash import send2trash
-
+import cv2
+import imagehash
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +351,7 @@ def build_duplicates_list(cache: dict, config: Config) -> dict:
     cache_path = config.script_settings.cache_file_path
 
     cache["duplicates"] = []
-    for hash, images_data in cache["hashes"].items():
+    for _hash, images_data in cache["hashes"].items():
         if len(images_data) <= 1:
             continue
 
